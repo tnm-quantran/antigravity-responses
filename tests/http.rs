@@ -236,7 +236,85 @@ async fn web_search_sidecar_separates_search_from_function_calls() {
     );
     assert_eq!(
         requests[2]["request"]["tools"][0]["functionDeclarations"][0]["name"],
+        "gateway_web_search"
+    );
+    assert_eq!(
+        requests[2]["request"]["tools"][0]["functionDeclarations"][1]["name"],
         "lookup"
+    );
+}
+
+#[tokio::test]
+async fn web_search_cache_only_returns_bad_request_before_upstream() {
+    let fixture = Fixture::new().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", fixture.url))
+        .json(&json!({"model":"gemini-test","input":"search","tools":[{
+            "type":"web_search","external_web_access":false
+        }]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cache-only")
+    );
+    assert!(fixture.requests.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn web_search_remains_available_until_three_searches() {
+    let fixture = Fixture::new().await;
+    let url = fixture.url.clone();
+    let response = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{url}/v1/responses"))
+            .json(&json!({"model":"gemini-test","input":"research","tools":[{
+                "type":"web_search"
+            }],"tool_choice":{"type":"web_search"}}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    });
+    for index in 0..3 {
+        fixture
+            .send(json!({"candidates":[{"content":{"parts":[{
+            "functionCall":{"name":"gateway_web_search","args":{"query":format!("query {index}")}}
+        }]},"finishReason":"STOP"}]}))
+            .await;
+        fixture.eof().await;
+        fixture.send(json!({"candidates":[{"content":{"parts":[{"text":"Search result"}]},
+            "groundingMetadata":{"webSearchQueries":[format!("query {index}")]},"finishReason":"STOP"}]})).await;
+        fixture.eof().await;
+    }
+    fixture.send(json!({"candidates":[{"content":{"parts":[{"text":"Final answer"}]},"finishReason":"STOP"}]})).await;
+    fixture.eof().await;
+    assert_eq!(response.await.unwrap()["status"], "completed");
+    let requests = fixture.requests.lock().await;
+    assert_eq!(requests.len(), 7);
+    for index in [0, 2, 4] {
+        assert_eq!(
+            requests[index]["request"]["tools"][0]["functionDeclarations"][0]["name"],
+            "gateway_web_search"
+        );
+        assert_eq!(
+            requests[index]["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+            "ANY"
+        );
+    }
+    assert_eq!(requests[6]["request"]["tools"], json!([]));
+    assert_eq!(
+        requests[6]["request"]["toolConfig"]["functionCallingConfig"]["mode"],
+        "NONE"
     );
 }
 

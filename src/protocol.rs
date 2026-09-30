@@ -314,9 +314,10 @@ fn declare_tool(
 ) -> Result<()> {
     let kind = required_string(spec, "type")?;
     if matches!(kind, "web_search" | "web_search_preview") {
-        if spec["external_web_access"] == false {
-            return Ok(());
-        }
+        ensure!(
+            kind != "web_search" || spec["external_web_access"] != false,
+            "Antigravity web search does not support cache-only mode (external_web_access=false); enable live web search"
+        );
         let flat = "gateway_web_search".to_owned();
         ensure!(!registry.contains_key(&flat), "duplicate tool name: {flat}");
         declarations.push(json!({"name":flat,"description":"Search the web or inspect a user-provided URL. Provide the URL or a concise search query.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}}));

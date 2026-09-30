@@ -134,6 +134,7 @@ fn dotenv_configures_model_credentials_and_oauth_for_standalone_cli() {
         std::fs::read_to_string(codex_home.join("antigravity_responses.config.toml")).unwrap();
     assert!(profile.contains("model = \"dotenv-model\""));
     assert!(profile.contains("model_provider = \"antigravity_responses\""));
+    assert!(profile.contains("web_search = \"live\""));
 
     let doctor = Command::new(env!("CARGO_BIN_EXE_antigravity-responses"))
         .current_dir(&root)
@@ -160,6 +161,25 @@ fn dotenv_configures_model_credentials_and_oauth_for_standalone_cli() {
     );
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn setup_updates_existing_web_search_mode_to_live() {
+    let config = Options::parse_from(["test", "--model", "gemini-test"]).config;
+    for mode in ["cached", "disabled", "live"] {
+        let profile = setup::merge_codex_profile(
+            &format!("web_search = \"{mode}\"\n"),
+            &config,
+            std::path::Path::new("models.json"),
+        )
+        .unwrap();
+        assert!(profile.contains("web_search = \"live\""));
+        assert_eq!(
+            setup::merge_codex_profile(&profile, &config, std::path::Path::new("models.json"))
+                .unwrap(),
+            profile
+        );
+    }
 }
 
 #[test]

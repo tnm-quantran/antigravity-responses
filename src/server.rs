@@ -893,7 +893,7 @@ async fn search_sidecar_stream(
             }
             request_body["contents"].as_array_mut().unwrap().push(json!({"role":"model","parts":model_parts}));
             request_body["contents"].as_array_mut().unwrap().push(json!({"role":"user","parts":function_responses}));
-            if searches > 0 {
+            if searches >= 3 {
                 let mut tools_empty = false;
                 if let Some(tools) = request_body["tools"].as_array_mut() {
                     if let Some(declarations) = tools.first_mut().and_then(|tool| tool["functionDeclarations"].as_array_mut()) {

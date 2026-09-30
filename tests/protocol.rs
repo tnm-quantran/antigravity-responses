@@ -111,6 +111,23 @@ fn invalid_google_tool_names_are_aliased_and_restored_for_codex() {
 }
 
 #[test]
+fn web_search_cache_only_is_rejected_without_dropping_the_tool() {
+    let request = json!({"model":"gemini-test","input":"search","tools":[{
+        "type":"web_search","external_web_access":false
+    }]});
+    let error = translate(&request, &mut replay()).unwrap_err();
+    assert!(error.to_string().contains("cache-only"));
+
+    let mut preview = request;
+    preview["tools"][0]["type"] = json!("web_search_preview");
+    let body = translate(&preview, &mut replay()).unwrap();
+    assert_eq!(
+        body["tools"][0]["functionDeclarations"][0]["name"],
+        "gateway_web_search"
+    );
+}
+
+#[test]
 fn web_search_maps_to_internal_function_tool() {
     let request = json!({
         "model":"gemini-test",

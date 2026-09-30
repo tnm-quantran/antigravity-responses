@@ -75,6 +75,7 @@ pub fn merge_codex_profile(text: &str, config: &Config, model_catalog: &Path) ->
     for (field, desired) in [
         ("model_provider", "antigravity_responses"),
         ("model", model),
+        ("web_search", "live"),
         (
             "model_reasoning_effort",
             crate::protocol::model_reasoning_effort(model).unwrap_or("medium"),
