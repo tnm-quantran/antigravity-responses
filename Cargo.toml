@@ -1,0 +1,27 @@
+[package]
+name = "antigravity-responses"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+eventsource-stream = "0.2"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+toml_edit = "0.23"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+

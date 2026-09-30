@@ -1,0 +1,229 @@
+use antigravity_responses::{
+    auth::{Credentials, save_credentials},
+    config::Config,
+    server::{Gateway, router},
+};
+use axum::{Json, Router, body::Body, extract::State, http::Response, routing::post};
+use clap::Parser;
+use futures::StreamExt;
+use pretty_assertions::assert_eq;
+use serde_json::{Value, json};
+use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::{Mutex, mpsc};
+
+#[derive(Parser)]
+struct Options {
+    #[command(flatten)]
+    config: Config,
+}
+
+struct Fixture {
+    url: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    chunks: mpsc::Sender<String>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    credentials: PathBuf,
+}
+
+impl Fixture {
+    async fn new() -> Self {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (chunks, receiver) = mpsc::channel::<String>(8);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let backend = Router::new()
+            .route(
+                "/v1internal:streamGenerateContent",
+                post({
+                    let receiver = receiver.clone();
+                    move |State(requests): State<Arc<Mutex<Vec<Value>>>>,
+                          Json(body): Json<Value>| {
+                        let receiver = receiver.clone();
+                        async move {
+                            requests.lock().await.push(body);
+                            let stream = async_stream::stream! {
+                                while let Some(chunk) = receiver.lock().await.recv().await {
+                                    if chunk == "EOF" { break; }
+                                    yield Ok::<_,Infallible>(chunk);
+                                }
+                            };
+                            Response::builder()
+                                .header("content-type", "text/event-stream")
+                                .body(Body::from_stream(stream))
+                                .unwrap()
+                        }
+                    }
+                }),
+            )
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        let backend_task = tokio::spawn(async { axum::serve(listener, backend).await.unwrap() });
+        let credentials =
+            std::env::temp_dir().join(format!("ag-test-{}.credentials.json", uuid::Uuid::new_v4()));
+        save_credentials(
+            &credentials,
+            &Credentials {
+                access_token: "test-only".into(),
+                refresh_token: None,
+                expires_at: u64::MAX,
+            },
+        )
+        .unwrap();
+        let mut config = Options::parse_from([
+            "test",
+            "--base-url",
+            &backend_url,
+            "--project",
+            "test-project",
+            "--credentials",
+            credentials.to_str().unwrap(),
+        ])
+        .config;
+        config.access_token = None;
+        let gateway = Gateway::new(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let gateway_task =
+            tokio::spawn(async { axum::serve(listener, router(gateway)).await.unwrap() });
+        Self {
+            url,
+            requests,
+            chunks,
+            tasks: vec![backend_task, gateway_task],
+            credentials,
+        }
+    }
+
+    async fn send(&self, value: Value) {
+        self.chunks
+            .send(format!("data: {value}\n\n"))
+            .await
+            .unwrap();
+    }
+
+    async fn eof(&self) {
+        self.chunks.send("EOF".into()).await.unwrap();
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        std::fs::remove_file(&self.credentials).expect("remove test credential file");
+    }
+}
+
+#[tokio::test]
+async fn http_tool_loop_preserves_signature_and_freeform_patch() {
+    let fixture = Fixture::new().await;
+    let client = reqwest::Client::new();
+    let request = json!({"model":"gemini-test","input":"fix","tools":[{"type":"custom","name":"apply_patch"}]});
+    fixture.send(json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"apply_patch","args":{"input":"*** Begin Patch\n*** End Patch"}},"thoughtSignature":"opaque-signature"}]},"finishReason":"STOP"}]})).await;
+    fixture.eof().await;
+    let response: Value = client
+        .post(format!("{}/v1/responses", fixture.url))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let call = response["output"][0].clone();
+    assert_eq!(call["type"], json!("custom_tool_call"));
+    fixture
+        .send(
+            json!({"candidates":[{"content":{"parts":[{"text":"fixed"}]},"finishReason":"STOP"}]}),
+        )
+        .await;
+    fixture.eof().await;
+    let mut next = request;
+    next["input"] = json!([{"role":"user","content":"fix"},call,{"type":"custom_tool_call_output","call_id":call["call_id"],"output":"success"}]);
+    let response: Value = client
+        .post(format!("{}/v1/responses", fixture.url))
+        .json(&next)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["output"][0]["content"][0]["text"], json!("fixed"));
+    let captured = fixture.requests.lock().await;
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        captured[1]["request"]["contents"][1]["parts"][0]["thoughtSignature"],
+        json!("opaque-signature")
+    );
+    assert_eq!(
+        captured[1]["request"]["contents"][2]["parts"][0]["functionResponse"]["name"],
+        json!("apply_patch")
+    );
+}
+
+#[tokio::test]
+async fn sse_delta_arrives_before_backend_completion() {
+    let fixture = Fixture::new().await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/responses", fixture.url))
+        .json(&json!({"model":"test","input":"hello","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    let mut bytes = response.bytes_stream();
+    let initial = tokio::time::timeout(Duration::from_secs(2), bytes.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&initial).contains("response.created"));
+    fixture
+        .send(json!({"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}))
+        .await;
+    let mut text = String::new();
+    while !text.contains("response.output_text.delta") {
+        let chunk = tokio::time::timeout(Duration::from_secs(2), bytes.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    assert!(!text.contains("response.completed"));
+    fixture
+        .send(json!({"candidates":[{"finishReason":"STOP"}]}))
+        .await;
+    fixture.eof().await;
+    while let Some(chunk) = bytes.next().await {
+        text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(text.contains("response.completed"));
+}
+
+#[tokio::test]
+async fn invalid_input_is_rejected_before_backend_and_truncated_stream_fails() {
+    let fixture = Fixture::new().await;
+    let client = reqwest::Client::new();
+    let response = client.post(format!("{}/v1/responses",fixture.url)).json(&json!({"model":"test","input":[{"type":"function_call_output","call_id":"missing","output":"x"}]})).send().await.unwrap();
+    assert_eq!(response.status(), 400);
+    assert!(fixture.requests.lock().await.is_empty());
+    fixture
+        .send(json!({"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}))
+        .await;
+    fixture.eof().await;
+    let response = client
+        .post(format!("{}/v1/responses", fixture.url))
+        .json(&json!({"model":"test","input":"x","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    let text = response.text().await.unwrap();
+    assert!(text.contains("response.failed"));
+    assert!(!text.contains("response.completed"));
+}
