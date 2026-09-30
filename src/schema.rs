@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 const GOOGLE_TOOL_SCHEMA_KEYS: &[&str] = &[
     "type",
@@ -14,6 +16,15 @@ const GOOGLE_TOOL_SCHEMA_KEYS: &[&str] = &[
     "$ref",
     "$defs",
     "definitions",
+    "pattern",
+    "minimum",
+    "maximum",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minProperties",
+    "maxProperties",
 ];
 const GOOGLE_TOOL_SCHEMA_ANNOTATIONS: &[&str] = &[
     "title",
@@ -32,18 +43,9 @@ const GOOGLE_UNSUPPORTED_CONSTRAINTS: &[&str] = &[
     "oneOf",
     "not",
     "const",
-    "pattern",
-    "minimum",
-    "maximum",
     "exclusiveMinimum",
     "exclusiveMaximum",
     "multipleOf",
-    "minLength",
-    "maxLength",
-    "minItems",
-    "maxItems",
-    "minProperties",
-    "maxProperties",
     "additionalProperties",
     "additionalItems",
     "uniqueItems",
@@ -67,6 +69,7 @@ const GOOGLE_UNSUPPORTED_CONSTRAINTS: &[&str] = &[
 const MAX_SCHEMA_DEPTH: usize = 24;
 const MAX_SCHEMA_NODES: usize = 1_024;
 const MAX_SCHEMA_BYTES: usize = 256 * 1024;
+type SchemaWarning = (String, Vec<String>);
 
 pub fn translate(schema: &Value, uppercase: bool) -> Result<Value> {
     let mut validation_nodes = MAX_SCHEMA_NODES;
@@ -88,13 +91,40 @@ pub fn translate(schema: &Value, uppercase: bool) -> Result<Value> {
 
 pub fn translate_tool(schema: &Value, uppercase: bool) -> Result<Value> {
     let (translated, dropped) = translate_tool_with_report(schema, uppercase)?;
-    if !dropped.is_empty() {
+    warn_tool_schema("<unnamed>", &dropped)?;
+    Ok(translated)
+}
+
+pub(crate) fn warn_tool_schema(tool: &str, dropped: &[String]) -> Result<()> {
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    static WARNED: OnceLock<Mutex<HashSet<SchemaWarning>>> = OnceLock::new();
+    let should_warn = record_schema_warning(
+        &mut *WARNED
+            .get_or_init(Mutex::default)
+            .lock()
+            .map_err(|_| anyhow::anyhow!("schema warning cache lock poisoned"))?,
+        (tool.to_owned(), dropped.to_vec()),
+    );
+    if should_warn {
         eprintln!(
-            "Google tool schema omitted unsupported constraints: {}",
+            "Google tool {tool} schema omitted unsupported constraints: {}",
             dropped.join(", ")
         );
     }
-    Ok(translated)
+    Ok(())
+}
+
+fn record_schema_warning(warned: &mut HashSet<SchemaWarning>, warning: SchemaWarning) -> bool {
+    if warned.contains(&warning) {
+        return false;
+    }
+    // ponytail: cache 1024 warning groups; beyond that, log uncached groups normally.
+    if warned.len() < 1_024 {
+        warned.insert(warning);
+    }
+    true
 }
 
 pub fn translate_tool_with_report(schema: &Value, uppercase: bool) -> Result<(Value, Vec<String>)> {
@@ -136,6 +166,27 @@ fn clean_tool_schema(value: &mut Value, dropped: &mut Vec<String>) -> Result<()>
     let Some(map) = value.as_object_mut() else {
         bail!("tool schema must be an object");
     };
+    if map.get("const").is_some_and(Value::is_string) {
+        let constant = map.remove("const").context("missing const")?;
+        ensure!(
+            map.get("type").is_none_or(|kind| kind == "string"
+                || kind
+                    .as_array()
+                    .is_some_and(|types| types.contains(&json!("string")))),
+            "const conflicts with type"
+        );
+        if let Some(values) = map.get("enum") {
+            ensure!(
+                values
+                    .as_array()
+                    .is_some_and(|values| values.contains(&constant)),
+                "const conflicts with enum"
+            );
+        }
+        map.insert("enum".into(), json!([constant]));
+        map.insert("type".into(), json!("string"));
+        map.remove("nullable");
+    }
     for key in map.keys() {
         if GOOGLE_UNSUPPORTED_CONSTRAINTS.contains(&key.as_str()) {
             dropped.push(key.clone());
@@ -275,7 +326,8 @@ fn rewrite(
                 result.insert(key.clone(), json!(values?));
             }
             "required" | "description" | "enum" | "format" | "minimum" | "maximum" | "minItems"
-            | "maxItems" | "minLength" | "maxLength" | "pattern" | "nullable" | "title" => {
+            | "maxItems" | "minLength" | "maxLength" | "minProperties" | "maxProperties"
+            | "pattern" | "nullable" | "title" => {
                 result.insert(key.clone(), value.clone());
             }
             "default" | "examples" => {}
@@ -283,4 +335,45 @@ fn rewrite(
         }
     }
     Ok(Value::Object(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_warnings_are_deduplicated_without_hiding_new_groups() {
+        let mut warned = HashSet::new();
+        let warning = ("search".into(), vec!["additionalProperties".into()]);
+        assert!(record_schema_warning(&mut warned, warning.clone()));
+        assert!(!record_schema_warning(&mut warned, warning.clone()));
+        assert!(record_schema_warning(
+            &mut warned,
+            ("search".into(), vec!["oneOf".into()])
+        ));
+        for index in 0..1_024 {
+            record_schema_warning(&mut warned, (format!("tool-{index}"), vec![]));
+        }
+        assert_eq!(warned.len(), 1_024);
+        assert!(!record_schema_warning(&mut warned, warning));
+        assert!(record_schema_warning(
+            &mut warned,
+            ("uncached".into(), vec!["additionalProperties".into()])
+        ));
+        assert_eq!(warned.len(), 1_024);
+    }
+
+    #[test]
+    fn repeated_translation_still_rejects_lossy_schemas() {
+        let request = json!({"model":"gemini-test","input":"inspect","tools":[{
+            "type":"function","name":"search","parameters":{
+                "type":"object","properties":{},"additionalProperties":false
+            }
+        }]});
+        let mut replay = crate::protocol::Replay::new(4096, std::time::Duration::from_secs(60));
+        for _ in 0..2 {
+            assert!(crate::protocol::translate_with_tools(&request, &mut replay, false).is_ok());
+            assert!(crate::protocol::translate_with_tools(&request, &mut replay, true).is_err());
+        }
+    }
 }

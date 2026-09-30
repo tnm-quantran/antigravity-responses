@@ -1,9 +1,12 @@
 use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+const REPLAY_HEADER: &[u8] = b"antigravity-replay-v1\n";
 
 #[derive(Clone)]
 pub struct Tool {
@@ -21,6 +24,9 @@ pub struct Replay {
     limit: usize,
     ttl: Duration,
     path: Option<PathBuf>,
+    pending: HashSet<String>,
+    disk_bytes: usize,
+    needs_compaction: bool,
 }
 
 impl Replay {
@@ -31,6 +37,9 @@ impl Replay {
             limit,
             ttl,
             path: None,
+            pending: HashSet::new(),
+            disk_bytes: 0,
+            needs_compaction: false,
         }
     }
 
@@ -41,8 +50,8 @@ impl Replay {
             let bytes = std::fs::read(&path)
                 .with_context(|| format!("read replay store {}", path.display()))?;
             ensure!(bytes.len() <= limit, "replay store exceeds state limit");
-            let entries: Vec<(String, Value, u64)> = serde_json::from_slice(&bytes)
-                .with_context(|| format!("parse replay store {}", path.display()))?;
+            replay.disk_bytes = bytes.len();
+            let entries = replay.read_replay_entries(&bytes, &path)?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();
@@ -52,7 +61,35 @@ impl Replay {
                 }
             }
         }
+        replay.pending.clear();
         Ok(replay)
+    }
+
+    fn read_replay_entries(
+        &mut self,
+        bytes: &[u8],
+        path: &Path,
+    ) -> Result<Vec<(String, Value, u64)>> {
+        let Some(journal) = bytes.strip_prefix(REPLAY_HEADER) else {
+            self.needs_compaction = true;
+            return serde_json::from_slice(bytes)
+                .with_context(|| format!("parse replay store {}", path.display()));
+        };
+        let mut entries = Vec::new();
+        let mut records = journal.split(|byte| *byte == b'\n');
+        if !records.next_back().unwrap_or_default().is_empty() {
+            eprintln!(
+                "replay store {}: discard incomplete final batch",
+                path.display()
+            );
+            self.needs_compaction = true;
+        }
+        for record in records {
+            let batch: Vec<(String, Value, u64)> = serde_json::from_slice(record)
+                .with_context(|| format!("parse replay batch {}", path.display()))?;
+            entries.extend(batch);
+        }
+        Ok(entries)
     }
 
     pub fn insert(&mut self, key: String, part: Value) -> Result<()> {
@@ -60,15 +97,25 @@ impl Replay {
     }
 
     fn insert_with_ttl(&mut self, key: String, part: Value, ttl: Duration) -> Result<()> {
-        let bytes = key.len() + serde_json::to_vec(&part)?.len();
+        let bytes = if self.path.is_some() {
+            serde_json::to_vec(&(&key, &part, u64::MAX))?.len() + 1
+        } else {
+            key.len() + serde_json::to_vec(&part)?.len()
+        };
+        let capacity = if self.path.is_some() {
+            self.limit.saturating_sub(REPLAY_HEADER.len() + 3)
+        } else {
+            self.limit
+        };
         ensure!(
-            bytes <= self.limit,
+            bytes <= capacity,
             "provider part exceeds replay state limit"
         );
         self.prune();
-        while self.bytes + bytes > self.limit || self.entries.len() >= 4096 {
-            if let Some((_, _, _, removed)) = self.entries.pop_front() {
+        while self.bytes + bytes > capacity || self.entries.len() >= 4096 {
+            if let Some((key, _, _, removed)) = self.entries.pop_front() {
                 self.bytes -= removed;
+                self.pending.remove(&key);
             }
         }
         self.bytes += bytes;
@@ -76,6 +123,9 @@ impl Replay {
         let inserted = Instant::now()
             .checked_sub(elapsed)
             .unwrap_or_else(Instant::now);
+        if self.path.is_some() {
+            self.pending.insert(key.clone());
+        }
         self.entries.push_back((key, part, inserted, bytes));
         Ok(())
     }
@@ -130,20 +180,58 @@ impl Replay {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        let entries = self
+        let pending = self
+            .entries
+            .iter()
+            .filter(|(key, _, _, _)| self.pending.contains(key))
+            .map(|(key, value, inserted, _)| {
+                (
+                    key,
+                    value,
+                    now.saturating_add(self.ttl.saturating_sub(inserted.elapsed()).as_secs()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = serde_json::to_vec(&pending)?;
+        bytes.push(b'\n');
+        if self.disk_bytes == 0
+            || self.needs_compaction
+            || self.disk_bytes.saturating_add(bytes.len()) > self.limit
+        {
+            bytes = self.compact_bytes()?;
+            crate::storage::write_private(&path, &bytes)
+                .context("compact response replay store")?;
+            self.disk_bytes = bytes.len();
+            self.needs_compaction = false;
+        } else {
+            crate::storage::append_private(&path, &bytes)
+                .context("append response replay batch")?;
+            self.disk_bytes += bytes.len();
+        }
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn compact_bytes(&self) -> Result<Vec<u8>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let records = self
             .entries
             .iter()
             .map(|(key, value, inserted, _)| {
                 let remaining = self.ttl.saturating_sub(inserted.elapsed()).as_secs();
-                (key.clone(), value.clone(), now.saturating_add(remaining))
+                (key, value, now.saturating_add(remaining))
             })
             .collect::<Vec<_>>();
-        let bytes = serde_json::to_vec(&entries)?;
+        let mut bytes = REPLAY_HEADER.to_vec();
+        serde_json::to_writer(&mut bytes, &records)?;
+        bytes.push(b'\n');
         ensure!(
             bytes.len() <= self.limit,
             "replay store exceeds state limit"
         );
-        crate::storage::write_private(&path, &bytes).context("persist response replay store")
+        Ok(bytes)
     }
 
     fn prune(&mut self) {
@@ -152,8 +240,9 @@ impl Replay {
             .front()
             .is_some_and(|(_, _, time, _)| time.elapsed() >= self.ttl)
         {
-            if let Some((_, _, _, bytes)) = self.entries.pop_front() {
+            if let Some((key, _, _, bytes)) = self.entries.pop_front() {
                 self.bytes -= bytes;
+                self.pending.remove(&key);
             }
         }
     }
@@ -168,13 +257,12 @@ pub fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 pub fn tools(request: &Value) -> Result<(Vec<Value>, HashMap<String, Tool>)> {
-    tools_with_policy(request, false)
+    let (mut declarations, registry) = declare_tools(request)?;
+    translate_declarations(request, &mut declarations, false)?;
+    Ok((declarations, registry))
 }
 
-fn tools_with_policy(
-    request: &Value,
-    reject_lossy: bool,
-) -> Result<(Vec<Value>, HashMap<String, Tool>)> {
+fn declare_tools(request: &Value) -> Result<(Vec<Value>, HashMap<String, Tool>)> {
     let mut declarations = Vec::new();
     let mut registry = HashMap::new();
     if let Some(specs) = request.get("tools") {
@@ -192,11 +280,19 @@ fn tools_with_policy(
             }
         }
     }
+    Ok((declarations, registry))
+}
+
+fn translate_declarations(
+    request: &Value,
+    declarations: &mut [Value],
+    reject_lossy: bool,
+) -> Result<()> {
     let uppercase = !request["model"]
         .as_str()
         .unwrap_or_default()
         .contains("claude");
-    for declaration in &mut declarations {
+    for declaration in declarations {
         let (schema, dropped) =
             crate::schema::translate_tool_with_report(&declaration["parameters"], uppercase)?;
         ensure!(
@@ -204,15 +300,10 @@ fn tools_with_policy(
             "tool schema loses unsupported constraints: {}",
             dropped.join(", ")
         );
-        if !dropped.is_empty() {
-            eprintln!(
-                "Google tool schema omitted unsupported constraints: {}",
-                dropped.join(", ")
-            );
-        }
+        crate::schema::warn_tool_schema(required_string(declaration, "name")?, &dropped)?;
         declaration["parameters"] = schema;
     }
-    Ok((declarations, registry))
+    Ok(())
 }
 
 fn declare_tool(
@@ -291,6 +382,18 @@ pub fn translate(request: &Value, replay: &mut Replay) -> Result<Value> {
     translate_with_tools(request, replay, false).map(|(result, _)| result)
 }
 
+pub(crate) fn model_reasoning_effort(model: &str) -> Option<&'static str> {
+    if !model.starts_with("gemini-") {
+        return None;
+    }
+    match model.rsplit_once('-')?.1 {
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        _ => None,
+    }
+}
+
 pub(crate) fn translate_with_tools(
     request: &Value,
     replay: &mut Replay,
@@ -301,7 +404,7 @@ pub(crate) fn translate_with_tools(
         request.get("background").is_none_or(|value| value == false),
         "background responses unsupported"
     );
-    let (declarations, registry) = tools_with_policy(request, reject_lossy_schema)?;
+    let (declarations, registry) = declare_tools(request)?;
     let mut contents = Vec::new();
     let mut system = Vec::new();
     if let Some(instructions) = request.get("instructions").filter(|value| !value.is_null()) {
@@ -349,6 +452,12 @@ pub(crate) fn translate_with_tools(
         result["tools"] = json!([{"functionDeclarations":declarations}]);
     }
     apply_options(request, &mut result, &registry)?;
+    if let Some(declarations) = result
+        .pointer_mut("/tools/0/functionDeclarations")
+        .and_then(Value::as_array_mut)
+    {
+        translate_declarations(request, declarations, reject_lossy_schema)?;
+    }
     Ok((result, registry))
 }
 
@@ -370,6 +479,9 @@ fn translate_item(
             if role == "assistant"
                 && let Some(id) = item["id"].as_str().filter(|id| id.starts_with("ag_"))
             {
+                if replay_tool_group(id, replay, contents, names)? {
+                    return Ok(());
+                }
                 let parts = replay.get(id)?;
                 for part in parts.as_array().context("invalid message replay")? {
                     push_part(contents, "model", part.clone());
@@ -391,11 +503,14 @@ fn translate_item(
         }
         "function_call" | "custom_tool_call" | "tool_search_call" => {
             let call_id = required_string(item, "call_id")?;
+            let restored_group = replay_tool_group(call_id, replay, contents, names)?;
             let part = replay
                 .get(call_id)
                 .or_else(|_| replay_call(item, call_id, registry))?;
             names.insert(call_id.to_owned(), part["functionCall"].clone());
-            push_part(contents, "model", part);
+            if !restored_group {
+                push_part(contents, "model", part);
+            }
         }
         // Codex's Antigravity adapter ignores hosted WebSearch history items.
         "web_search_call" => {}
@@ -403,19 +518,30 @@ fn translate_item(
             let call_id = required_string(item, "call_id")?;
             let call = names
                 .get(call_id)
+                .cloned()
+                .or_else(|| {
+                    let part = replay.get(call_id).ok()?;
+                    contents
+                        .iter()
+                        .flat_map(|content| content["parts"].as_array().into_iter().flatten())
+                        .any(|history| {
+                            history["functionCall"].is_object()
+                                && history["functionCall"] == part["functionCall"]
+                        })
+                        .then(|| part["functionCall"].clone())
+                })
                 .context("tool output has no matching call in history")?;
             let output = item
                 .get("output")
                 .or_else(|| item.get("tools"))
                 .context("tool output is missing")?;
-            push_part(
-                contents,
-                "user",
-                json!({"functionResponse":{"name":call["name"],"id":call["id"],"response":{"output":output}}}),
-            );
+            push_part(contents, "user", function_response(&call, output)?);
         }
         "reasoning" => {
             if let Some(id) = item["id"].as_str() {
+                if replay_tool_group(id, replay, contents, names)? {
+                    return Ok(());
+                }
                 let parts = replay.get(id)?;
                 for part in parts.as_array().context("invalid reasoning replay")? {
                     push_part(contents, "model", part.clone());
@@ -444,9 +570,51 @@ fn replay_call(item: &Value, call_id: &str, registry: &HashMap<String, Tool>) ->
     };
     let mut call = json!({"functionCall":{"name":wire_name,"id":call_id,"args":args}});
     if let Some(signature) = item.pointer("/extra_content/google/thought_signature") {
-        call["functionCall"]["thoughtSignature"] = signature.clone();
+        call["thoughtSignature"] = signature.clone();
     }
     Ok(call)
+}
+
+fn replay_tool_group(
+    call_id: &str,
+    replay: &mut Replay,
+    contents: &mut Vec<Value>,
+    names: &mut HashMap<String, Value>,
+) -> Result<bool> {
+    let Ok(group) = replay.get(&format!("tool_group:{call_id}")) else {
+        return Ok(false);
+    };
+    let id = group.as_str().context("invalid tool group id")?;
+    let marker = format!("group:{id}");
+    if names.contains_key(&marker) {
+        return Ok(true);
+    }
+    let parts = replay.get(id)?;
+    let parts = parts.as_array().context("invalid tool group parts")?;
+    let previous = contents
+        .last()
+        .filter(|content| content["role"] == "model")
+        .and_then(|content| content["parts"].as_array());
+    let repeated = previous.map_or(0, |previous| {
+        (0..=previous.len().min(parts.len()))
+            .rev()
+            .find(|count| previous[previous.len() - count..] == parts[..*count])
+            .unwrap_or(0)
+    });
+    for part in &parts[repeated..] {
+        push_part(contents, "model", part.clone());
+    }
+    let outputs = replay.get(&format!("group_outputs:{id}"))?;
+    for output in outputs.as_array().context("invalid tool group outputs")? {
+        let call = replay.get(required_string(output, "call_id")?)?;
+        push_part(
+            contents,
+            "user",
+            function_response(&call["functionCall"], &output["output"])?,
+        );
+    }
+    names.insert(marker, json!(true));
+    Ok(true)
 }
 
 fn message_parts(content: &Value) -> Result<Vec<Value>> {
@@ -463,18 +631,93 @@ fn message_parts(content: &Value) -> Result<Vec<Value>> {
                 parts.push(json!({"text":required_string(part,"text")?}))
             }
             "input_image" => {
-                let url = required_string(part, "image_url")?;
-                let (mime, data) = url
-                    .strip_prefix("data:")
-                    .and_then(|url| url.split_once(";base64,"))
-                    .context("only inline base64 images supported")?;
-                ensure!(mime.starts_with("image/"), "invalid image mime type");
-                parts.push(json!({"inlineData":{"mimeType":mime,"data":data}}));
+                parts.push(json!({"inlineData":image_data(part)?}));
             }
             kind => bail!("unsupported content: {kind}"),
         }
     }
     Ok(parts)
+}
+
+fn image_data(part: &Value) -> Result<Value> {
+    let (mime, data) = if part["type"] == "image" {
+        (
+            required_string(part, "mimeType")?,
+            required_string(part, "data")?,
+        )
+    } else {
+        required_string(part, "image_url")?
+            .strip_prefix("data:")
+            .and_then(|url| url.split_once(";base64,"))
+            .context("only inline base64 images supported")?
+    };
+    ensure!(
+        mime.starts_with("image/") && mime.len() > 6,
+        "invalid image mime type"
+    );
+    ensure!(!data.is_empty(), "image data is empty");
+    let mut buffer = [0_u8; 3072];
+    let mut chunks = data.as_bytes().chunks(4096).peekable();
+    while let Some(chunk) = chunks.next() {
+        ensure!(
+            chunks.peek().is_none() || !chunk.contains(&b'='),
+            "invalid image base64 padding"
+        );
+        STANDARD
+            .decode_slice(chunk, &mut buffer)
+            .context("invalid image base64 data")?;
+    }
+    Ok(json!({"mimeType":mime,"data":data}))
+}
+
+fn function_response(call: &Value, output: &Value) -> Result<Value> {
+    let (converted_output, parts) =
+        if let Some(blocks) = output.as_array().or_else(|| output["content"].as_array()) {
+            let (converted, parts) = convert_image_blocks(blocks)?;
+            let converted_output = if output.is_array() {
+                Value::Array(converted)
+            } else {
+                let mut fields = output
+                    .as_object()
+                    .context("invalid tool output")?
+                    .iter()
+                    .filter(|(key, _)| key.as_str() != "content")
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                fields.insert("content".into(), Value::Array(converted));
+                Value::Object(fields)
+            };
+            (converted_output, parts)
+        } else {
+            (output.clone(), Vec::new())
+        };
+    let mut response = json!({"name":call["name"],"id":call["id"],"response":{"output":null}});
+    response["response"]["output"] = converted_output;
+    if !parts.is_empty() {
+        response["parts"] = Value::Array(parts);
+    }
+    let mut part = json!({"functionResponse":null});
+    part["functionResponse"] = response;
+    Ok(part)
+}
+
+fn convert_image_blocks(blocks: &[Value]) -> Result<(Vec<Value>, Vec<Value>)> {
+    let mut parts = Vec::new();
+    let mut converted = Vec::with_capacity(blocks.len());
+    for (index, block) in blocks.iter().enumerate() {
+        if matches!(block["type"].as_str(), Some("input_image" | "image")) {
+            let name = format!("tool_image_{index}");
+            let mut data = image_data(block)?;
+            data["displayName"] = json!(name);
+            let mut part = json!({"inlineData":null});
+            part["inlineData"] = data;
+            parts.push(part);
+            converted.push(json!({"$ref":name}));
+        } else {
+            converted.push(block.clone());
+        }
+    }
+    Ok((converted, parts))
 }
 
 pub fn push_part(contents: &mut Vec<Value>, role: &str, part: Value) {
@@ -596,7 +839,11 @@ fn apply_options(
             result["generationConfig"][target] = json!(number);
         }
     }
-    if let Some(effort) = request["reasoning"]["effort"].as_str() {
+    let effort = request["model"]
+        .as_str()
+        .and_then(model_reasoning_effort)
+        .or_else(|| request["reasoning"]["effort"].as_str());
+    if let Some(effort) = effort {
         result["generationConfig"]["thinkingConfig"]["thinkingLevel"] = json!(match effort {
             "none" | "minimal" | "low" => "LOW",
             "medium" => "MEDIUM",

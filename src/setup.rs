@@ -75,10 +75,44 @@ pub fn merge_codex_profile(text: &str, config: &Config, model_catalog: &Path) ->
     for (field, desired) in [
         ("model_provider", "antigravity_responses"),
         ("model", model),
+        (
+            "model_reasoning_effort",
+            crate::protocol::model_reasoning_effort(model).unwrap_or("medium"),
+        ),
     ] {
         document[field] = value(desired);
     }
     document["model_catalog_json"] = value(model_catalog.to_string_lossy().as_ref());
+    ensure_table(&mut document["sandbox_workspace_write"])?;
+    let sandbox = &mut document["sandbox_workspace_write"];
+    ensure!(
+        sandbox
+            .get("network_access")
+            .is_none_or(|current| current.as_bool() == Some(true)),
+        "conflicting sandbox_workspace_write.network_access"
+    );
+    sandbox["network_access"] = value(true);
+
+    ensure_table(&mut document["features"])?;
+    ensure_table(&mut document["features"]["network_proxy"])?;
+    let proxy = &mut document["features"]["network_proxy"];
+    ensure!(
+        proxy
+            .get("enabled")
+            .is_none_or(|current| current.as_bool() == Some(true)),
+        "conflicting features.network_proxy.enabled"
+    );
+    proxy["enabled"] = value(true);
+    ensure_table(&mut proxy["domains"])?;
+    for domain in ["api.github.com", "api.clickup.com"] {
+        ensure!(
+            proxy["domains"]
+                .get(domain)
+                .is_none_or(|current| current.as_str() == Some("allow")),
+            "conflicting features.network_proxy.domains.{domain}"
+        );
+        proxy["domains"][domain] = value("allow");
+    }
     Ok(document.to_string())
 }
 

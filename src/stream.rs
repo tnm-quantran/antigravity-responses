@@ -37,13 +37,17 @@ impl Translator {
         data
     }
 
-    pub fn add_search_grounding(&mut self, metadata: &Value) -> Result<Vec<Value>> {
+    pub fn add_search_grounding(
+        &mut self,
+        metadata: &Value,
+        replay: &mut Replay,
+    ) -> Result<Vec<Value>> {
         let mut events = Vec::new();
         let mut metadata = metadata.clone();
         if let Some(metadata) = metadata.as_object_mut() {
             metadata.remove("groundingSupports");
         }
-        self.grounding(&metadata, &mut events)?;
+        self.grounding(&metadata, replay, &mut events)?;
         Ok(events)
     }
 
@@ -76,7 +80,7 @@ impl Translator {
             .and_then(|values| values.first())
         {
             if let Some(metadata) = candidate.get("groundingMetadata") {
-                self.grounding(metadata, &mut events)?;
+                self.grounding(metadata, replay, &mut events)?;
             }
             if let Some(parts) = candidate["content"]["parts"].as_array() {
                 for part in parts {
@@ -95,6 +99,21 @@ impl Translator {
                     matches!(reason, "STOP" | "MAX_TOKENS"),
                     "backend generation failed: {reason}"
                 );
+                let has_client_calls = self.response["output"].as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        matches!(
+                            item["type"].as_str(),
+                            Some("function_call" | "custom_tool_call" | "tool_search_call")
+                        )
+                    })
+                });
+                if reason == "STOP" && !has_client_calls {
+                    if let Some((item, _, _)) = self.active.as_mut() {
+                        if item["type"] == "message" {
+                            item["phase"] = json!("final_answer");
+                        }
+                    }
+                }
                 self.close(replay, &mut events)?;
                 if reason == "MAX_TOKENS" {
                     self.response["status"] = json!("incomplete");
@@ -108,7 +127,12 @@ impl Translator {
         Ok(events)
     }
 
-    fn grounding(&mut self, metadata: &Value, events: &mut Vec<Value>) -> Result<()> {
+    fn grounding(
+        &mut self,
+        metadata: &Value,
+        replay: &mut Replay,
+        events: &mut Vec<Value>,
+    ) -> Result<()> {
         for annotation in grounding_annotations(metadata) {
             if !self.grounding_annotations.contains(&annotation) {
                 self.grounding_annotations.push(annotation);
@@ -117,6 +141,7 @@ impl Translator {
         if self.web_search_item.is_some() {
             return Ok(());
         }
+        self.close(replay, events)?;
         let queries = metadata["webSearchQueries"]
             .as_array()
             .cloned()
@@ -153,8 +178,22 @@ impl Translator {
     }
 
     fn text(&mut self, part: &Value, replay: &mut Replay, events: &mut Vec<Value>) -> Result<()> {
+        let text = part["text"].as_str().unwrap_or_default();
+        if text.is_empty() && part.get("thoughtSignature").is_none() {
+            return Ok(());
+        }
+        if text.is_empty() {
+            if let Some((_, parts, _)) = self.active.as_mut() {
+                parts.push(part.clone());
+                return Ok(());
+            }
+        }
         let is_thought = part["thought"] == true;
-        let kind = if is_thought { "reasoning" } else { "message" };
+        let kind = if is_thought || text.is_empty() {
+            "reasoning"
+        } else {
+            "message"
+        };
         if self
             .active
             .as_ref()
@@ -167,20 +206,27 @@ impl Translator {
         }
         let (item, parts, text_buffer) = self.active.as_mut().context("missing active output")?;
         parts.push(part.clone());
-        let text = part["text"].as_str().unwrap_or_default();
         if text.is_empty() || (is_thought && !self.show_reasoning) {
             return Ok(());
         }
-        text_buffer.push_str(text);
+        let starts_summary = is_thought && text_buffer.is_empty();
+        let delta = text.to_owned();
+        text_buffer.push_str(&delta);
         let id = item["id"].clone();
         let index = self.response["output"]
             .as_array()
             .context("invalid output")?
             .len();
         let event = if is_thought {
+            if starts_summary {
+                events.push(self.event(
+                    "response.reasoning_summary_part.added",
+                    json!({"item_id":id,"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":""}}),
+                ));
+            }
             self.event(
-                "response.reasoning_text.delta",
-                json!({"item_id":id,"output_index":index,"content_index":0,"delta":text}),
+                "response.reasoning_summary_text.delta",
+                json!({"item_id":id,"output_index":index,"summary_index":0,"delta":delta}),
             )
         } else {
             self.event("response.output_text.delta", json!({"item_id":id,"output_index":index,"content_index":0,"delta":text,"logprobs":[]}))
@@ -194,7 +240,7 @@ impl Translator {
         let item = if kind == "reasoning" {
             json!({"id":id,"type":"reasoning","summary":[],"content":[]})
         } else {
-            json!({"id":id,"type":"message","role":"assistant","status":"in_progress","content":[{"type":"output_text","text":"","annotations":[],"logprobs":[]}]})
+            json!({"id":id,"type":"message","role":"assistant","phase":"commentary","status":"in_progress","content":[{"type":"output_text","text":"","annotations":[],"logprobs":[]}]})
         };
         let index = self.response["output"].as_array().map_or(0, Vec::len);
         events.push(self.event(
@@ -224,7 +270,15 @@ impl Translator {
             events.push(self.event("response.output_text.done", json!({"item_id":id,"output_index":index,"content_index":0,"text":item["content"][0]["text"],"logprobs":[]})));
             events.push(self.event("response.content_part.done", json!({"item_id":id,"output_index":index,"content_index":0,"part":item["content"][0]})));
         } else if self.show_reasoning && !text.is_empty() {
-            item["content"] = json!([{"type":"reasoning_text","text":text}]);
+            item["summary"] = json!([{"type":"summary_text","text":text}]);
+            events.push(self.event(
+                "response.reasoning_summary_text.done",
+                json!({"item_id":id,"output_index":index,"summary_index":0,"text":text}),
+            ));
+            events.push(self.event(
+                "response.reasoning_summary_part.done",
+                json!({"item_id":id,"output_index":index,"summary_index":0,"part":item["summary"][0]}),
+            ));
         }
         events.push(self.event(
             "response.output_item.done",
@@ -274,7 +328,7 @@ impl Translator {
         } else {
             item["arguments"] = json!(args.to_string());
         }
-        if let Some(signature) = call.get("thoughtSignature") {
+        if let Some(signature) = part.get("thoughtSignature") {
             item["extra_content"] = json!({"google":{"thought_signature":signature}});
         }
         let index = self.response["output"]

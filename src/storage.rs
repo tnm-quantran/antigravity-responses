@@ -33,3 +33,18 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     })?;
     Ok(())
 }
+
+pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .context("open private replay journal")?;
+    let length = file.metadata()?.len();
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        file.set_len(length)
+            .context("roll back incomplete replay batch")?;
+        file.sync_all().context("sync replay rollback")?;
+        return Err(error).context("write replay batch");
+    }
+    Ok(())
+}
