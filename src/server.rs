@@ -65,7 +65,7 @@ fn codex_model(slug: &str, display_name: &str, priority: usize) -> Value {
         "priority": priority,
         "support_verbosity": false,
         "model_messages": {
-            "instructions_template": "You are Codex, an AI coding assistant. Follow the system and developer instructions supplied for this session. Help the user complete the requested work using available tools."
+            "instructions_template": "You are Codex, an AI coding assistant. Follow the system and developer instructions supplied for this session. Help the user complete the requested work using available tools. For every URL the user provides, and whenever asked to open, read, inspect, summarize, or verify a web page, you MUST call the provided web_search tool and pass it the URL or a concise query. Never use shell commands such as exec_command, curl, wget, or browser automation to fetch web content. Use shell commands only for local files and local commands. If web_search cannot access the page, explain that limitation; never fall back to shell."
         },
         "apply_patch_tool_type": "freeform",
         "web_search_tool_type": "text",
@@ -799,30 +799,27 @@ async fn search_sidecar_stream(
             }
             request_body["contents"].as_array_mut().unwrap().push(json!({"role":"model","parts":model_parts}));
             request_body["contents"].as_array_mut().unwrap().push(json!({"role":"user","parts":function_responses}));
-            if searches == 3 {
-                let available = request_body["tools"].as_array().into_iter().flatten()
-                    .filter_map(|tool| tool["functionDeclarations"].as_array())
-                    .flatten()
-                    .filter_map(|declaration| declaration["name"].as_str())
-                    .filter(|name| *name != "gateway_web_search")
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                let function_config = &mut request_body["toolConfig"]["functionCallingConfig"];
-                if let Some(names) = function_config["allowedFunctionNames"].as_array_mut() {
-                    names.retain(|name| name != "gateway_web_search");
-                    if names.is_empty() {
-                        function_config["mode"] = json!("NONE");
-                        function_config.as_object_mut().unwrap().remove("allowedFunctionNames");
+            if searches > 0 {
+                let mut tools_empty = false;
+                if let Some(tools) = request_body["tools"].as_array_mut() {
+                    if let Some(declarations) = tools.first_mut().and_then(|tool| tool["functionDeclarations"].as_array_mut()) {
+                        declarations.retain(|declaration| declaration["name"] != "gateway_web_search");
+                        if declarations.is_empty() {
+                            tools.clear();
+                            tools_empty = true;
+                        }
                     }
-                } else if function_config["mode"] == "NONE" {
-                    // Preserve an explicit no-tools choice.
-                } else if available.is_empty() {
-                    function_config["mode"] = json!("NONE");
-                } else if function_config["mode"] == "ANY" {
-                    function_config["allowedFunctionNames"] = json!(available);
-                } else {
-                    function_config["mode"] = json!("VALIDATED");
-                    function_config["allowedFunctionNames"] = json!(available);
+                }
+                if let Some(function_config) = request_body.pointer_mut("/toolConfig/functionCallingConfig") {
+                    if let Some(names) = function_config["allowedFunctionNames"].as_array_mut() {
+                        names.retain(|name| name != "gateway_web_search");
+                        if names.is_empty() {
+                            function_config["mode"] = json!("NONE");
+                            function_config.as_object_mut().unwrap().remove("allowedFunctionNames");
+                        }
+                    } else if tools_empty {
+                        function_config["mode"] = json!("NONE");
+                    }
                 }
             }
             upstream_response = match upstream(&gateway, &model, request_body.clone()).await {

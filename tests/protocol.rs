@@ -85,7 +85,7 @@ fn web_search_maps_to_internal_function_tool() {
             {"type":"web_search_call","id":"previous-search"}
         ],
         "tools":[
-            {"type":"web_search","external_web_access":false,"filters":{"allowed_domains":["example.com"]}},
+            {"type":"web_search","filters":{"allowed_domains":["example.com"]}},
             {"type":"function","name":"lookup","parameters":{"type":"object"}}
         ]
     });
@@ -93,7 +93,7 @@ fn web_search_maps_to_internal_function_tool() {
     assert_eq!(
         body["tools"],
         json!([{"functionDeclarations":[
-            {"name":"gateway_web_search","description":"Search the web for current information. Provide a concise query.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}},
+            {"name":"gateway_web_search","description":"Search the web or inspect a user-provided URL. Provide the URL or a concise search query.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}},
             {"name":"lookup","description":"","parameters":{"type":"OBJECT"}}
         ]}])
     );

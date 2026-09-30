@@ -228,7 +228,7 @@ fn declare_tool(
         }
         let flat = "gateway_web_search".to_owned();
         ensure!(!registry.contains_key(&flat), "duplicate tool name: {flat}");
-        declarations.push(json!({"name":flat,"description":"Search the web for current information. Provide a concise query.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}}));
+        declarations.push(json!({"name":flat,"description":"Search the web or inspect a user-provided URL. Provide the URL or a concise search query.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}}));
         registry.insert(
             flat.clone(),
             Tool {
