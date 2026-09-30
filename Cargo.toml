@@ -1,6 +1,6 @@
 [package]
 name = "antigravity-responses"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -12,6 +12,7 @@ async-stream = "0.3"
 axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
 eventsource-stream = "0.2"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
@@ -24,4 +25,3 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
-

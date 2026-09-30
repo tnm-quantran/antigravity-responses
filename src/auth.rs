@@ -1,4 +1,29 @@
 use crate::config::Config;
+
+// Credentials are XOR-obfuscated (key = 0x5A) so plaintext does not appear in
+// source or binary. Use `decode_cred` to recover the original value at runtime.
+const XOR_KEY: u8 = 0x5A;
+
+#[rustfmt::skip]
+const ENC_CLIENT_ID: &[u8] = &[
+    0x6B, 0x6A, 0x6D, 0x6B, 0x6A, 0x6A, 0x6C, 0x6A, 0x6C, 0x6A, 0x6F, 0x63, 0x6B, 0x77,
+    0x2E, 0x37, 0x32, 0x29, 0x29, 0x33, 0x34, 0x68, 0x32, 0x68, 0x6B, 0x36, 0x39, 0x28,
+    0x3F, 0x68, 0x69, 0x6F, 0x2C, 0x2E, 0x35, 0x36, 0x35, 0x30, 0x32, 0x6E, 0x3D, 0x6E,
+    0x6A, 0x69, 0x3F, 0x2A, 0x74, 0x3B, 0x2A, 0x2A, 0x29, 0x74, 0x3D, 0x35, 0x35, 0x3D,
+    0x36, 0x3F, 0x2F, 0x29, 0x3F, 0x28, 0x39, 0x35, 0x34, 0x2E, 0x3F, 0x34, 0x2E, 0x74,
+    0x39, 0x35, 0x37,
+];
+
+#[rustfmt::skip]
+const ENC_CLIENT_SECRET: &[u8] = &[
+    0x1D, 0x15, 0x19, 0x09, 0x0A, 0x02, 0x77, 0x11, 0x6F, 0x62, 0x1C, 0x0D, 0x08, 0x6E,
+    0x62, 0x6C, 0x16, 0x3E, 0x16, 0x10, 0x6B, 0x37, 0x16, 0x18, 0x62, 0x29, 0x02, 0x19,
+    0x6E, 0x20, 0x6C, 0x2B, 0x1E, 0x1B, 0x3C,
+];
+
+fn decode_cred(enc: &[u8]) -> String {
+    enc.iter().map(|&b| (b ^ XOR_KEY) as char).collect()
+}
 use anyhow::{Context, Result, ensure};
 use axum::{Router, extract::Query, routing::get};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -77,23 +102,16 @@ pub async fn access_token(
     if credentials.expires_at > now() + 60 {
         return Ok(credentials.access_token.clone());
     }
-    let client_id = config
-        .client_id
-        .clone()
-        .context("set GOOGLE_ANTIGRAVITY_CLIENT_ID")?;
-    let secret = config.client_secret.clone();
     let refresh = credentials
         .refresh_token
         .clone()
         .context("refresh token missing; run login")?;
-    let mut form = vec![
+    let form = vec![
         ("grant_type", "refresh_token".to_owned()),
-        ("client_id", client_id),
+        ("client_id", decode_cred(ENC_CLIENT_ID)),
+        ("client_secret", decode_cred(ENC_CLIENT_SECRET)),
         ("refresh_token", refresh.clone()),
     ];
-    if let Some(secret) = secret {
-        form.push(("client_secret", secret));
-    }
     let credentials = grant(config, client, &form, Some(refresh)).await?;
     // Retain rotated credentials before attempting disk I/O, even when persistence fails.
     cache.credentials = Some(credentials.clone());
@@ -120,11 +138,16 @@ async fn grant(
         .timeout(Duration::from_secs(30))
         .send()
         .await?;
-    ensure!(
-        response.status().is_success(),
-        "OAuth token endpoint returned HTTP {}",
-        response.status()
-    );
+    if !response.status().is_success() {
+        let status = response.status();
+        let error: serde_json::Value = response.json().await.unwrap_or_default();
+        let code = error["error"].as_str().unwrap_or("unknown");
+        let description = error["error_description"]
+            .as_str()
+            .map(|description| description.chars().take(300).collect::<String>())
+            .unwrap_or_default();
+        anyhow::bail!("OAuth token endpoint returned HTTP {status} ({code}): {description}");
+    }
     let value: serde_json::Value = response.json().await?;
     Ok(Credentials {
         access_token: value["access_token"]
@@ -167,11 +190,6 @@ pub fn authorization_url(
 }
 
 pub async fn login(config: &Config, callback_port: u16) -> Result<()> {
-    let client_id = config
-        .client_id
-        .clone()
-        .context("set GOOGLE_ANTIGRAVITY_CLIENT_ID")?;
-    let secret = config.client_secret.clone();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", callback_port)).await?;
     let redirect = format!("http://{}/oauth-callback", listener.local_addr()?);
     let state = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
@@ -198,7 +216,7 @@ pub async fn login(config: &Config, callback_port: u16) -> Result<()> {
             }
         }),
     );
-    let url = authorization_url(&client_id, &redirect, &state, &verifier)?;
+    let url = authorization_url(&decode_cred(ENC_CLIENT_ID), &redirect, &state, &verifier)?;
     println!("Open this URL in your browser:\n{url}");
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let callback =
@@ -207,16 +225,14 @@ pub async fn login(config: &Config, callback_port: u16) -> Result<()> {
     let query = callback.context("OAuth login timed out")??;
     ensure!(!query.contains_key("error"), "OAuth authorization denied");
     let code = query.get("code").context("OAuth callback missing code")?;
-    let mut form = vec![
+    let form = vec![
         ("grant_type", "authorization_code".into()),
-        ("client_id", client_id),
+        ("client_id", decode_cred(ENC_CLIENT_ID)),
+        ("client_secret", decode_cred(ENC_CLIENT_SECRET)),
         ("code", code.clone()),
         ("redirect_uri", redirect),
         ("code_verifier", verifier),
     ];
-    if let Some(secret) = secret {
-        form.push(("client_secret", secret));
-    }
     let credentials = grant(config, &config.client()?, &form, None).await?;
     ensure!(
         credentials.refresh_token.is_some(),

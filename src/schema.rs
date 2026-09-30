@@ -1,8 +1,174 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 
+const GOOGLE_TOOL_SCHEMA_KEYS: &[&str] = &[
+    "type",
+    "nullable",
+    "required",
+    "format",
+    "description",
+    "properties",
+    "items",
+    "enum",
+    "anyOf",
+    "$ref",
+    "$defs",
+    "definitions",
+];
+const GOOGLE_TOOL_SCHEMA_ANNOTATIONS: &[&str] = &[
+    "title",
+    "default",
+    "examples",
+    "example",
+    "$comment",
+    "$schema",
+    "$id",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+const GOOGLE_UNSUPPORTED_CONSTRAINTS: &[&str] = &[
+    "allOf",
+    "oneOf",
+    "not",
+    "const",
+    "pattern",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minProperties",
+    "maxProperties",
+    "additionalProperties",
+    "additionalItems",
+    "uniqueItems",
+    "contains",
+    "minContains",
+    "maxContains",
+    "dependencies",
+    "dependentRequired",
+    "dependentSchemas",
+    "patternProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "if",
+    "then",
+    "else",
+    "prefixItems",
+    "$dynamicRef",
+    "$recursiveRef",
+];
+const MAX_SCHEMA_DEPTH: usize = 24;
+const MAX_SCHEMA_NODES: usize = 1_024;
+const MAX_SCHEMA_BYTES: usize = 256 * 1024;
+
 pub fn translate(schema: &Value, uppercase: bool) -> Result<Value> {
-    rewrite(schema, schema, uppercase, &mut Vec::new())
+    let mut validation_nodes = MAX_SCHEMA_NODES;
+    validate_schema(schema, 0, &mut validation_nodes)?;
+    ensure!(
+        serde_json::to_vec(schema)?.len() <= MAX_SCHEMA_BYTES,
+        "tool schema exceeds byte limit"
+    );
+    let mut expansion_nodes = MAX_SCHEMA_NODES;
+    rewrite(
+        schema,
+        schema,
+        uppercase,
+        &mut Vec::new(),
+        0,
+        &mut expansion_nodes,
+    )
+}
+
+pub fn translate_tool(schema: &Value, uppercase: bool) -> Result<Value> {
+    let (translated, dropped) = translate_tool_with_report(schema, uppercase)?;
+    if !dropped.is_empty() {
+        eprintln!(
+            "Google tool schema omitted unsupported constraints: {}",
+            dropped.join(", ")
+        );
+    }
+    Ok(translated)
+}
+
+pub fn translate_tool_with_report(schema: &Value, uppercase: bool) -> Result<(Value, Vec<String>)> {
+    let mut schema = schema.clone();
+    let mut validation_nodes = MAX_SCHEMA_NODES;
+    validate_schema(&schema, 0, &mut validation_nodes)?;
+    ensure!(
+        serde_json::to_vec(&schema)?.len() <= MAX_SCHEMA_BYTES,
+        "tool schema exceeds byte limit"
+    );
+    let mut dropped = Vec::new();
+    clean_tool_schema(&mut schema, &mut dropped)?;
+    dropped.sort_unstable();
+    dropped.dedup();
+    Ok((translate(&schema, uppercase)?, dropped))
+}
+
+fn validate_schema(value: &Value, depth: usize, remaining: &mut usize) -> Result<()> {
+    ensure!(depth <= MAX_SCHEMA_DEPTH, "tool schema exceeds depth limit");
+    ensure!(*remaining > 0, "tool schema exceeds node limit");
+    *remaining -= 1;
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                validate_schema(value, depth + 1, remaining)?;
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                validate_schema(value, depth + 1, remaining)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn clean_tool_schema(value: &mut Value, dropped: &mut Vec<String>) -> Result<()> {
+    let Some(map) = value.as_object_mut() else {
+        bail!("tool schema must be an object");
+    };
+    for key in map.keys() {
+        if GOOGLE_UNSUPPORTED_CONSTRAINTS.contains(&key.as_str()) {
+            dropped.push(key.clone());
+            continue;
+        }
+        ensure!(
+            GOOGLE_TOOL_SCHEMA_KEYS.contains(&key.as_str())
+                || GOOGLE_TOOL_SCHEMA_ANNOTATIONS.contains(&key.as_str()),
+            "unsupported tool schema keyword: {key}"
+        );
+    }
+    map.retain(|key, _| {
+        GOOGLE_TOOL_SCHEMA_KEYS.contains(&key.as_str())
+            && !GOOGLE_UNSUPPORTED_CONSTRAINTS.contains(&key.as_str())
+    });
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(properties) = map.get_mut(key).and_then(Value::as_object_mut) {
+            for schema in properties.values_mut() {
+                clean_tool_schema(schema, dropped)?;
+            }
+        }
+    }
+    for key in ["items"] {
+        if let Some(schema) = map.get_mut(key) {
+            clean_tool_schema(schema, dropped)?;
+        }
+    }
+    if let Some(variants) = map.get_mut("anyOf").and_then(Value::as_array_mut) {
+        for schema in variants {
+            clean_tool_schema(schema, dropped)?;
+        }
+    }
+    Ok(())
 }
 
 fn rewrite(
@@ -10,7 +176,15 @@ fn rewrite(
     root: &Value,
     uppercase: bool,
     references: &mut Vec<String>,
+    depth: usize,
+    remaining: &mut usize,
 ) -> Result<Value> {
+    ensure!(
+        depth <= MAX_SCHEMA_DEPTH,
+        "tool schema exceeds expanded depth limit"
+    );
+    ensure!(*remaining > 0, "tool schema exceeds expanded node limit");
+    *remaining -= 1;
     let map = schema
         .as_object()
         .context("tool schema must be an object")?;
@@ -35,7 +209,7 @@ fn rewrite(
             }
         }
         references.push(reference.to_owned());
-        let result = rewrite(&resolved, root, uppercase, references);
+        let result = rewrite(&resolved, root, uppercase, references, depth + 1, remaining);
         references.pop();
         return result;
     }
@@ -75,20 +249,28 @@ fn rewrite(
                 let rewritten: Result<Map<String, Value>> = properties
                     .iter()
                     .map(|(name, schema)| {
-                        Ok((name.clone(), rewrite(schema, root, uppercase, references)?))
+                        Ok((
+                            name.clone(),
+                            rewrite(schema, root, uppercase, references, depth + 1, remaining)?,
+                        ))
                     })
                     .collect();
                 result.insert(key.clone(), Value::Object(rewritten?));
             }
             "items" => {
-                result.insert(key.clone(), rewrite(value, root, uppercase, references)?);
+                result.insert(
+                    key.clone(),
+                    rewrite(value, root, uppercase, references, depth + 1, remaining)?,
+                );
             }
             "anyOf" => {
                 let values: Result<Vec<Value>> = value
                     .as_array()
                     .context("anyOf must be an array")?
                     .iter()
-                    .map(|schema| rewrite(schema, root, uppercase, references))
+                    .map(|schema| {
+                        rewrite(schema, root, uppercase, references, depth + 1, remaining)
+                    })
                     .collect();
                 result.insert(key.clone(), json!(values?));
             }

@@ -168,6 +168,120 @@ async fn http_tool_loop_preserves_signature_and_freeform_patch() {
 }
 
 #[tokio::test]
+async fn web_search_sidecar_separates_search_from_function_calls() {
+    let fixture = Fixture::new().await;
+    let client = reqwest::Client::new();
+    fixture
+        .send(json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"gateway_web_search","args":{"query":"example query"}}}]},"finishReason":"STOP"}]}))
+        .await;
+    fixture.eof().await;
+    fixture
+        .send(json!({"candidates":[{"content":{"parts":[{"text":"Example answer."}]},"groundingMetadata":{"webSearchQueries":["example query"],"groundingChunks":[{"web":{"uri":"https://example.com","title":"Example"}}],"groundingSupports":[{"segment":{"startIndex":0,"endIndex":7,"text":"Example"},"groundingChunkIndices":[0]}]},"finishReason":"STOP"}]}))
+        .await;
+    fixture.eof().await;
+    fixture
+        .send(json!({"candidates":[{"content":{"parts":[{"text":"Example answer."}]},"finishReason":"STOP"}]}))
+        .await;
+    fixture.eof().await;
+    let response: Value = client
+        .post(format!("{}/v1/responses", fixture.url))
+        .json(&json!({"model":"gemini-test","input":"search the web","tools":[{"type":"web_search"},{"type":"function","name":"lookup","parameters":{"type":"object"}}]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["output"][0]["type"], "web_search_call");
+    assert_eq!(response["output"][0]["action"]["type"], "search");
+    assert_eq!(response["output"][0]["action"]["query"], "example query");
+    assert_eq!(response["output"][1]["type"], "message");
+    assert_eq!(response["output"].as_array().unwrap().len(), 2);
+    assert!(
+        response["output"][1]["content"][0]["annotations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let requests = fixture.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0]["request"]["tools"][0]["functionDeclarations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        requests[0]["request"]["toolConfig"]
+            .get("includeServerSideToolInvocations")
+            .is_none()
+    );
+    assert_eq!(
+        requests[1]["request"]["tools"],
+        json!([{"googleSearch":{}}])
+    );
+    assert_eq!(
+        requests[1]["request"]["toolConfig"]["includeServerSideToolInvocations"],
+        true
+    );
+    assert_eq!(
+        requests[2]["request"]["tools"][0]["functionDeclarations"][0]["name"],
+        "lookup"
+    );
+}
+
+#[tokio::test]
+async fn previous_response_id_continues_the_conversation() {
+    let fixture = Fixture::new().await;
+    let client = reqwest::Client::new();
+    fixture
+        .send(json!({"candidates":[{"content":{"parts":[{"text":"first answer"}]},"finishReason":"STOP"}]}))
+        .await;
+    fixture.eof().await;
+    let first: Value = client
+        .post(format!("{}/v1/responses", fixture.url))
+        .json(&json!({"model":"test","input":"first prompt"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    fixture
+        .send(json!({"candidates":[{"content":{"parts":[{"text":"second answer"}]},"finishReason":"STOP"}]}))
+        .await;
+    fixture.eof().await;
+    let _: Value = client
+        .post(format!("{}/v1/responses", fixture.url))
+        .json(&json!({"model":"test","previous_response_id":first["id"],"input":"second prompt"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let captured = fixture.requests.lock().await;
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        captured[1]["request"]["contents"],
+        json!([
+            {"role":"user","parts":[{"text":"first prompt"}]},
+            {"role":"model","parts":[{"text":"first answer"}]},
+            {"role":"user","parts":[{"text":"second prompt"}]}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn sse_delta_arrives_before_backend_completion() {
     let fixture = Fixture::new().await;
     let response = reqwest::Client::new()

@@ -2,7 +2,7 @@ use antigravity_responses::{
     config::Config,
     protocol::{Replay, tools, translate},
     schema,
-    setup::merge_codex,
+    setup::{merge_codex, merge_codex_profile},
     stream::Translator,
 };
 use clap::Parser;
@@ -47,6 +47,177 @@ fn tools_and_system_policy_keep_their_boundaries() {
 }
 
 #[test]
+fn invalid_google_tool_names_are_aliased_and_restored_for_codex() {
+    let request = json!({
+        "model":"gemini-test",
+        "input":"call it",
+        "tools":[{"type":"function","name":"mcp__server__search.v2"}]
+    });
+    let (declarations, registry) = tools(&request).unwrap();
+    let wire_name = declarations[0]["name"].as_str().unwrap();
+    assert_ne!(wire_name, "mcp__server__search.v2");
+    assert!(wire_name.len() <= 64);
+    assert!(
+        wire_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    );
+
+    let mut stream = Translator::new("gemini-test", registry, "hidden");
+    stream
+        .ingest(
+            &json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":wire_name,"args":{}}}]},"finishReason":"STOP"}]}),
+            &mut replay(),
+        )
+        .unwrap();
+    assert_eq!(
+        stream.completed().unwrap()["response"]["output"][0]["name"],
+        "mcp__server__search.v2"
+    );
+}
+
+#[test]
+fn web_search_maps_to_internal_function_tool() {
+    let request = json!({
+        "model":"gemini-test",
+        "input":[
+            {"role":"user","content":"search this"},
+            {"type":"web_search_call","id":"previous-search"}
+        ],
+        "tools":[
+            {"type":"web_search","external_web_access":false,"filters":{"allowed_domains":["example.com"]}},
+            {"type":"function","name":"lookup","parameters":{"type":"object"}}
+        ]
+    });
+    let body = translate(&request, &mut replay()).unwrap();
+    assert_eq!(
+        body["tools"],
+        json!([{"functionDeclarations":[
+            {"name":"gateway_web_search","description":"Search the web for current information. Provide a concise query.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}},
+            {"name":"lookup","description":"","parameters":{"type":"OBJECT"}}
+        ]}])
+    );
+    assert!(body.get("toolConfig").is_none());
+    assert!(
+        body["toolConfig"]
+            .get("includeServerSideToolInvocations")
+            .is_none()
+    );
+    assert_eq!(body["contents"].as_array().unwrap().len(), 1);
+
+    for kind in ["web_search", "web_search_preview"] {
+        let search_only = translate(
+            &json!({"model":"gemini-test","input":"search","tools":[{"type":kind}]}),
+            &mut replay(),
+        )
+        .unwrap();
+        assert_eq!(
+            search_only["tools"][0]["functionDeclarations"][0]["name"],
+            "gateway_web_search"
+        );
+    }
+
+    let forced = translate(
+        &json!({
+            "model":"gemini-test",
+            "input":"lookup",
+            "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+            "tool_choice":{"type":"function","name":"lookup"}
+        }),
+        &mut replay(),
+    )
+    .unwrap();
+    assert_eq!(
+        forced["toolConfig"]["functionCallingConfig"],
+        json!({"mode":"ANY","allowedFunctionNames":["lookup"]})
+    );
+}
+
+#[test]
+fn tool_search_uses_its_declared_schema_and_round_trips_execution() {
+    let request = json!({
+        "model":"gemini-test",
+        "input":"find a tool",
+        "tools":[{
+            "type":"tool_search",
+            "execution":"client",
+            "description":"Find available tools",
+            "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+        }]
+    });
+    let body = translate(&request, &mut replay()).unwrap();
+    assert_eq!(
+        body["tools"][0]["functionDeclarations"][0],
+        json!({"name":"tool_search","description":"Find available tools","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}})
+    );
+
+    let mut state = replay();
+    let mut stream = Translator::new("gemini-test", tools(&request).unwrap().1, "hidden");
+    stream
+        .ingest(
+            &json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"tool_search","args":{"query":"calendar"}}}]},"finishReason":"STOP"}]}),
+            &mut state,
+        )
+        .unwrap();
+    let output = stream.completed().unwrap()["response"]["output"][0].clone();
+    assert_eq!(output["type"], "tool_search_call");
+    assert_eq!(output["execution"], "client");
+    assert_eq!(output["arguments"]["query"], "calendar");
+}
+
+#[test]
+fn generation_options_map_and_validate() {
+    let request = json!({
+        "model":"gemini-test", "input":"hello", "temperature":0.4, "top_p":0.8
+    });
+    let body = translate(&request, &mut replay()).unwrap();
+    assert_eq!(body["generationConfig"]["temperature"], json!(0.4));
+    assert_eq!(body["generationConfig"]["topP"], json!(0.8));
+    assert!(
+        translate(
+            &json!({"model":"x","input":"x","temperature":3}),
+            &mut replay()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn previous_response_history_is_chained_and_bounded() {
+    let mut state = replay();
+    state
+        .store_response("one", None, vec![json!({"role":"user","content":"first"})])
+        .unwrap();
+    state
+        .store_response(
+            "two",
+            Some("one"),
+            vec![json!({"role":"assistant","content":"answer"})],
+        )
+        .unwrap();
+    let body = translate(
+        &json!({"model":"test","previous_response_id":"two","input":"next"}),
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(
+        body["contents"],
+        json!([
+            {"role":"user","parts":[{"text":"first"}]},
+            {"role":"model","parts":[{"text":"answer"}]},
+            {"role":"user","parts":[{"text":"next"}]}
+        ])
+    );
+    assert!(
+        translate(
+            &json!({"model":"test","previous_response_id":"missing","input":"next"}),
+            &mut state
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn signed_reasoning_and_parallel_custom_tools_round_trip() {
     let request = json!({"model":"gemini-test","input":"fix","tools":[{"type":"custom","name":"apply_patch"},{"type":"namespace","name":"mcp__apps__","tools":[{"type":"function","name":"search"}]}]});
     let mut state = replay();
@@ -56,7 +227,7 @@ fn signed_reasoning_and_parallel_custom_tools_round_trip() {
     assert!(
         events
             .iter()
-            .any(|event| event["type"] == "response.reasoning_summary_text.delta")
+            .any(|event| event["type"] == "response.reasoning_text.delta")
     );
     assert!(
         !events
@@ -199,13 +370,41 @@ fn schema_refs_are_inlined_and_cycles_rejected() {
 }
 
 #[test]
+fn tool_schema_drops_google_unsupported_constraints() {
+    let schema = json!({
+        "type":"object",
+        "additionalProperties":false,
+        "properties":{"query":{"type":"string","pattern":"^[a-z]+$","minLength":2}}
+    });
+    assert_eq!(
+        schema::translate_tool(&schema, true).unwrap(),
+        json!({"type":"OBJECT","properties":{"query":{"type":"STRING"}}})
+    );
+}
+
+#[test]
 fn config_merge_preserves_user_settings_is_idempotent_and_rejects_conflicts() {
-    let text = "# Keep this\nmodel_provider = 'existing'\n[profiles.user]\nmodel = 'mine'\n";
+    let text = "# Keep this\nmodel_provider = 'existing'\nprofile = 'antigravity_responses'\n[profiles.antigravity_responses]\nmodel = 'legacy'\n[profiles.user]\nmodel = 'mine'\n";
     let merged = merge_codex(text, &config()).unwrap();
     assert!(merged.contains("# Keep this"));
     assert!(merged.contains("model_provider = 'existing'"));
+    assert!(!merged.contains("profile = 'antigravity_responses'"));
+    assert!(!merged.contains("[profiles.antigravity_responses]"));
     assert!(merged.contains("model = 'mine'"));
     assert_eq!(merge_codex(&merged, &config()).unwrap(), merged);
+    let profile =
+        merge_codex_profile("", &config(), std::path::Path::new("/tmp/models.json")).unwrap();
+    assert!(profile.contains("model_provider = \"antigravity_responses\""));
+    assert!(profile.contains("model = \"gemini-test\""));
+    assert_eq!(
+        merge_codex_profile(
+            &profile,
+            &config(),
+            std::path::Path::new("/tmp/models.json")
+        )
+        .unwrap(),
+        profile
+    );
     assert!(
         merge_codex(
             "[model_providers.antigravity_responses]\nbase_url='https://elsewhere'",

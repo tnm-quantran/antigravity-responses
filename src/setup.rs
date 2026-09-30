@@ -16,17 +16,11 @@ pub fn codex_home(path: Option<PathBuf>) -> Result<PathBuf> {
 
 pub fn merge_codex(text: &str, config: &Config) -> Result<String> {
     let mut document: DocumentMut = text.parse().context("invalid Codex config TOML")?;
-    let model = config
-        .model
-        .as_deref()
-        .context("set --model or ANTIGRAVITY_MODEL before setup")?;
     let provider = format!("http://{}/v1", config.listen);
     let fields = [
         ("model_providers", "name", "Antigravity Responses"),
         ("model_providers", "base_url", provider.as_str()),
         ("model_providers", "wire_api", "responses"),
-        ("profiles", "model_provider", "antigravity_responses"),
-        ("profiles", "model", model),
     ];
     for (group, field, desired) in fields {
         ensure_table(&mut document[group])?;
@@ -53,9 +47,39 @@ pub fn merge_codex(text: &str, config: &Config) -> Result<String> {
     );
     provider["requires_openai_auth"] = value(false);
     provider["supports_websockets"] = value(false);
+    if let Some(profiles) = document.get_mut("profiles") {
+        ensure!(profiles.is_table(), "profiles section must be a TOML table");
+        profiles
+            .as_table_mut()
+            .unwrap()
+            .remove("antigravity_responses");
+        if profiles.as_table().unwrap().is_empty() {
+            document.as_table_mut().remove("profiles");
+        }
+    }
+    if document.get("profile").and_then(Item::as_str) == Some("antigravity_responses") {
+        document.as_table_mut().remove("profile");
+    }
     let result = document.to_string();
     let _: DocumentMut = result.parse()?;
     Ok(result)
+}
+
+pub fn merge_codex_profile(text: &str, config: &Config, model_catalog: &Path) -> Result<String> {
+    let mut document: DocumentMut = text.parse().context("invalid Codex profile TOML")?;
+    document.as_table_mut().remove("show_raw_agent_reasoning");
+    let model = config
+        .model
+        .as_deref()
+        .context("set --model or ANTIGRAVITY_MODEL before setup")?;
+    for (field, desired) in [
+        ("model_provider", "antigravity_responses"),
+        ("model", model),
+    ] {
+        document[field] = value(desired);
+    }
+    document["model_catalog_json"] = value(model_catalog.to_string_lossy().as_ref());
+    Ok(document.to_string())
 }
 
 fn ensure_table(item: &mut Item) -> Result<()> {
@@ -68,32 +92,34 @@ fn ensure_table(item: &mut Item) -> Result<()> {
 
 pub fn setup(config: &Config, target: &str, home: &Path) -> Result<()> {
     if matches!(target, "codex" | "all") {
-        let path = home.join("config.toml");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
-        };
-        let merged = merge_codex(&text, config)?;
-        if merged != text {
-            std::fs::create_dir_all(home)?;
-            if path.exists() {
-                let backup = home.join(format!("config.toml.{}.bak", uuid::Uuid::new_v4()));
-                std::fs::copy(&path, &backup)?;
-                println!("Backup: {}", backup.display());
-            }
-            crate::storage::write_private(&path, merged.as_bytes())?;
-            ensure!(
-                std::fs::read_to_string(&path)? == merged,
-                "config verification failed"
-            );
+        let model_catalog = home.join("antigravity_responses.models.json");
+        let catalog = crate::server::codex_model_catalog();
+        let writes = [
+            (
+                model_catalog.clone(),
+                serde_json::to_string_pretty(&catalog).context("serialize model catalog")?,
+            ),
+            (
+                home.join("config.toml"),
+                merge_codex(&read_config(&home.join("config.toml"))?, config)?,
+            ),
+            (
+                home.join("antigravity_responses.config.toml"),
+                merge_codex_profile(
+                    &read_config(&home.join("antigravity_responses.config.toml"))?,
+                    config,
+                    &model_catalog,
+                )?,
+            ),
+        ];
+        for (path, merged) in writes {
+            write_config(&path, &merged)?;
         }
-        println!("Codex profile ready: codex -p antigravity_responses");
     }
     if matches!(target, "rtk" | "all") {
         run(
             "rtk",
-            &["init", "-g", "--codex", "--no-patch", "--no-trust-filters"],
+            &["init", "-g", "--codex", "--no-trust-filters"],
             home,
         )
         .context("install RTK and retry setup rtk; gateway works without RTK")?;
@@ -106,20 +132,50 @@ pub fn setup(config: &Config, target: &str, home: &Path) -> Result<()> {
             home,
         )?;
         run("codex", &["plugin", "add", "ponytail@ponytail"], home)?;
-        println!(
-            "Review/trust Ponytail hooks in Codex. Select its mode inside Codex; gateway does not configure behavior."
-        );
     }
     Ok(())
 }
 
+fn read_config(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_config(path: &Path, merged: &str) -> Result<()> {
+    let text = read_config(path)?;
+    if merged == text {
+        return Ok(());
+    }
+    let home = path.parent().context("config path has no parent")?;
+    std::fs::create_dir_all(home)?;
+    if path.exists() {
+        let filename = path.file_name().unwrap().to_string_lossy();
+        let backup = home.join(format!("{filename}.{}.bak", uuid::Uuid::new_v4()));
+        std::fs::copy(path, &backup)?;
+    }
+    crate::storage::write_private(path, merged.as_bytes())?;
+    ensure!(
+        std::fs::read_to_string(path)? == merged,
+        "config verification failed"
+    );
+    Ok(())
+}
+
 fn run(program: &str, args: &[&str], home: &Path) -> Result<()> {
-    let status = Command::new(program)
+    let output = Command::new(program)
         .args(args)
         .env("CODEX_HOME", home)
-        .status()
+        .output()
         .with_context(|| format!("run {program}"))?;
-    ensure!(status.success(), "{program} exited with {status}");
+    ensure!(
+        output.status.success(),
+        "{program} exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Ok(())
 }
 
@@ -133,21 +189,19 @@ pub async fn doctor(config: &Config, home: &Path) -> Result<()> {
     );
     check(
         "Codex config",
-        std::fs::read_to_string(home.join("config.toml"))
+        std::fs::read_to_string(home.join("antigravity_responses.config.toml"))
             .context("missing Codex config")
             .and_then(|text| {
                 let document: DocumentMut = text.parse()?;
                 ensure!(
-                    document
-                        .get("profiles")
-                        .and_then(|profiles| profiles.get("antigravity_responses"))
-                        .and_then(|profile| profile.get("model_provider"))
-                        .and_then(Item::as_str)
+                    document.get("model_provider").and_then(Item::as_str)
                         == Some("antigravity_responses"),
                     "profile missing"
                 );
+                let provider_text = std::fs::read_to_string(home.join("config.toml"))?;
+                let provider_config: DocumentMut = provider_text.parse()?;
                 ensure!(
-                    document
+                    provider_config
                         .get("model_providers")
                         .and_then(|providers| providers.get("antigravity_responses"))
                         .and_then(|provider| provider.get("base_url"))

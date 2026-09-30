@@ -1,3 +1,4 @@
 /target/
+.env
 *.credentials.json
-
+antigravity.credentials.replay.json

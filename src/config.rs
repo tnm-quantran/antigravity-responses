@@ -4,6 +4,23 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+const DOTENV_KEYS: [&str; 2] = ["ANTIGRAVITY_MODEL", "ANTIGRAVITY_CREDENTIALS"];
+
+pub fn load_dotenv() -> Result<()> {
+    let path = std::path::Path::new(".env");
+    if !path.exists() {
+        return Ok(());
+    }
+    for entry in dotenvy::from_path_iter(path).context("parse .env")? {
+        let (key, value) = entry.context("invalid .env entry")?;
+        if DOTENV_KEYS.contains(&key.as_str()) && std::env::var_os(&key).is_none() {
+            // Called before the Tokio runtime starts, while this process is single-threaded.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+    Ok(())
+}
+
 #[derive(Args, Clone)]
 pub struct Config {
     #[arg(long, env = "ANTIGRAVITY_LISTEN", default_value = "127.0.0.1:8787")]
@@ -11,10 +28,14 @@ pub struct Config {
     #[arg(
         long,
         env = "ANTIGRAVITY_BASE_URL",
-        default_value = "https://cloudcode-pa.googleapis.com"
+        default_value = "https://daily-cloudcode-pa.googleapis.com"
     )]
     pub base_url: String,
-    #[arg(long, env = "ANTIGRAVITY_MODEL")]
+    #[arg(
+        long,
+        env = "ANTIGRAVITY_MODEL",
+        default_value = "gemini-3.8-flash-medium"
+    )]
     pub model: Option<String>,
     #[arg(long, env = "ANTIGRAVITY_PROJECT")]
     pub project: Option<String>,
@@ -26,10 +47,6 @@ pub struct Config {
     pub credentials: PathBuf,
     #[arg(long, env = "ANTIGRAVITY_ACCESS_TOKEN", hide_env_values = true)]
     pub access_token: Option<String>,
-    #[arg(long, env = "GOOGLE_ANTIGRAVITY_CLIENT_ID")]
-    pub client_id: Option<String>,
-    #[arg(long, env = "GOOGLE_ANTIGRAVITY_CLIENT_SECRET", hide_env_values = true)]
-    pub client_secret: Option<String>,
     #[arg(
         long,
         env = "ANTIGRAVITY_TOKEN_URL",
@@ -42,6 +59,8 @@ pub struct Config {
     pub state_ttl_seconds: u64,
     #[arg(long, env = "ANTIGRAVITY_STATE_BYTES", default_value_t = 67108864)]
     pub state_bytes: usize,
+    #[arg(long, env = "ANTIGRAVITY_SCHEMA_POLICY", default_value = "compatible", value_parser = ["compatible", "reject-lossy"])]
+    pub schema_policy: String,
     #[arg(long, env = "ANTIGRAVITY_REQUEST_BYTES", default_value_t = 16777216)]
     pub request_bytes: usize,
     #[arg(long, env = "ANTIGRAVITY_RESPONSE_BYTES", default_value_t = 16777216)]

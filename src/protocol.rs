@@ -1,14 +1,18 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct Tool {
+    pub flat: String,
     pub name: String,
     pub namespace: Option<String>,
     pub kind: String,
     pub execution: Option<Value>,
+    pub strict: bool,
 }
 
 pub struct Replay {
@@ -16,6 +20,7 @@ pub struct Replay {
     bytes: usize,
     limit: usize,
     ttl: Duration,
+    path: Option<PathBuf>,
 }
 
 impl Replay {
@@ -25,10 +30,36 @@ impl Replay {
             bytes: 0,
             limit,
             ttl,
+            path: None,
         }
     }
 
+    pub fn open(limit: usize, ttl: Duration, path: PathBuf) -> Result<Self> {
+        let mut replay = Self::new(limit, ttl);
+        replay.path = Some(path.clone());
+        if path.exists() {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read replay store {}", path.display()))?;
+            ensure!(bytes.len() <= limit, "replay store exceeds state limit");
+            let entries: Vec<(String, Value, u64)> = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse replay store {}", path.display()))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            for (key, value, expires) in entries {
+                if expires > now {
+                    replay.insert_with_ttl(key, value, Duration::from_secs(expires - now))?;
+                }
+            }
+        }
+        Ok(replay)
+    }
+
     pub fn insert(&mut self, key: String, part: Value) -> Result<()> {
+        self.insert_with_ttl(key, part, self.ttl)
+    }
+
+    fn insert_with_ttl(&mut self, key: String, part: Value, ttl: Duration) -> Result<()> {
         let bytes = key.len() + serde_json::to_vec(&part)?.len();
         ensure!(
             bytes <= self.limit,
@@ -41,7 +72,11 @@ impl Replay {
             }
         }
         self.bytes += bytes;
-        self.entries.push_back((key, part, Instant::now(), bytes));
+        let elapsed = self.ttl.saturating_sub(ttl.min(self.ttl));
+        let inserted = Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(Instant::now);
+        self.entries.push_back((key, part, inserted, bytes));
         Ok(())
     }
 
@@ -53,6 +88,62 @@ impl Replay {
             .find(|(id, _, _, _)| id == key)
             .map(|(_, part, _, _)| part.clone())
             .context("provider replay state expired or missing; start a new conversation")
+    }
+
+    pub fn response_history(&mut self, id: &str) -> Result<Vec<Value>> {
+        let mut history = Vec::new();
+        let mut current = Some(id.to_owned());
+        while let Some(id) = current {
+            let response = self
+                .get(&format!("response:{id}"))
+                .with_context(|| format!("previous response {id} expired or is unknown"))?;
+            current = response["parent"].as_str().map(str::to_owned);
+            history.push(
+                response["items"]
+                    .as_array()
+                    .context("invalid previous response history")?
+                    .clone(),
+            );
+        }
+        history.reverse();
+        Ok(history.into_iter().flatten().collect())
+    }
+
+    pub fn store_response(
+        &mut self,
+        id: &str,
+        parent: Option<&str>,
+        items: Vec<Value>,
+    ) -> Result<()> {
+        self.insert(
+            format!("response:{id}"),
+            json!({"parent":parent,"items":items}),
+        )?;
+        self.persist()
+    }
+
+    fn persist(&mut self) -> Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        self.prune();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let entries = self
+            .entries
+            .iter()
+            .map(|(key, value, inserted, _)| {
+                let remaining = self.ttl.saturating_sub(inserted.elapsed()).as_secs();
+                (key.clone(), value.clone(), now.saturating_add(remaining))
+            })
+            .collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&entries)?;
+        ensure!(
+            bytes.len() <= self.limit,
+            "replay store exceeds state limit"
+        );
+        crate::storage::write_private(&path, &bytes).context("persist response replay store")
     }
 
     fn prune(&mut self) {
@@ -77,6 +168,13 @@ pub fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 pub fn tools(request: &Value) -> Result<(Vec<Value>, HashMap<String, Tool>)> {
+    tools_with_policy(request, false)
+}
+
+fn tools_with_policy(
+    request: &Value,
+    reject_lossy: bool,
+) -> Result<(Vec<Value>, HashMap<String, Tool>)> {
     let mut declarations = Vec::new();
     let mut registry = HashMap::new();
     if let Some(specs) = request.get("tools") {
@@ -99,8 +197,20 @@ pub fn tools(request: &Value) -> Result<(Vec<Value>, HashMap<String, Tool>)> {
         .unwrap_or_default()
         .contains("claude");
     for declaration in &mut declarations {
-        declaration["parameters"] =
-            crate::schema::translate(&declaration["parameters"], uppercase)?;
+        let (schema, dropped) =
+            crate::schema::translate_tool_with_report(&declaration["parameters"], uppercase)?;
+        ensure!(
+            !reject_lossy || dropped.is_empty(),
+            "tool schema loses unsupported constraints: {}",
+            dropped.join(", ")
+        );
+        if !dropped.is_empty() {
+            eprintln!(
+                "Google tool schema omitted unsupported constraints: {}",
+                dropped.join(", ")
+            );
+        }
+        declaration["parameters"] = schema;
     }
     Ok((declarations, registry))
 }
@@ -112,6 +222,26 @@ fn declare_tool(
     registry: &mut HashMap<String, Tool>,
 ) -> Result<()> {
     let kind = required_string(spec, "type")?;
+    if matches!(kind, "web_search" | "web_search_preview") {
+        if spec["external_web_access"] == false {
+            return Ok(());
+        }
+        let flat = "gateway_web_search".to_owned();
+        ensure!(!registry.contains_key(&flat), "duplicate tool name: {flat}");
+        declarations.push(json!({"name":flat,"description":"Search the web for current information. Provide a concise query.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}}));
+        registry.insert(
+            flat.clone(),
+            Tool {
+                flat: flat.clone(),
+                name: flat,
+                namespace: None,
+                kind: "web_search".to_owned(),
+                execution: None,
+                strict: false,
+            },
+        );
+        return Ok(());
+    }
     ensure!(
         matches!(kind, "function" | "custom" | "tool_search"),
         "unsupported tool type: {kind}"
@@ -125,7 +255,11 @@ fn declare_tool(
     let flat = namespace
         .filter(|namespace| *namespace != "functions")
         .map_or_else(|| name.to_owned(), |namespace| format!("{namespace}{name}"));
-    ensure!(!registry.contains_key(&flat), "duplicate tool name: {flat}");
+    ensure!(
+        !registry.values().any(|tool| tool.flat == flat),
+        "duplicate tool name: {flat}"
+    );
+    let wire_name = google_tool_name(&flat, registry);
     let mut description = spec["description"].as_str().unwrap_or_default().to_owned();
     let parameters = if kind == "custom" {
         description.push_str(
@@ -138,46 +272,69 @@ fn declare_tool(
             .cloned()
             .unwrap_or(json!({"type":"object","properties":{}}))
     };
-    declarations.push(json!({"name":flat,"description":description,"parameters":parameters}));
+    declarations.push(json!({"name":wire_name,"description":description,"parameters":parameters}));
     registry.insert(
-        flat,
+        wire_name,
         Tool {
+            flat,
             name: name.to_owned(),
             namespace: namespace.map(str::to_owned),
             kind: kind.to_owned(),
             execution: spec.get("execution").cloned(),
+            strict: spec["strict"] == true,
         },
     );
     Ok(())
 }
 
 pub fn translate(request: &Value, replay: &mut Replay) -> Result<Value> {
+    translate_with_tools(request, replay, false).map(|(result, _)| result)
+}
+
+pub(crate) fn translate_with_tools(
+    request: &Value,
+    replay: &mut Replay,
+    reject_lossy_schema: bool,
+) -> Result<(Value, HashMap<String, Tool>)> {
     ensure!(request.is_object(), "request must be an object");
-    ensure!(
-        request
-            .get("previous_response_id")
-            .is_none_or(Value::is_null),
-        "previous_response_id unsupported; send full history"
-    );
     ensure!(
         request.get("background").is_none_or(|value| value == false),
         "background responses unsupported"
     );
-    let (declarations, _) = tools(request)?;
+    let (declarations, registry) = tools_with_policy(request, reject_lossy_schema)?;
     let mut contents = Vec::new();
     let mut system = Vec::new();
     if let Some(instructions) = request.get("instructions").filter(|value| !value.is_null()) {
         system
             .push(json!({"text":instructions.as_str().context("instructions must be a string")?}));
     }
-    let items = match request.get("input") {
+    let mut items = match request.get("input") {
         Some(Value::String(text)) => vec![json!({"role":"user","content":text})],
         Some(Value::Array(items)) => items.clone(),
         _ => bail!("input must be a string or array"),
     };
+    if let Some(previous) = request
+        .get("previous_response_id")
+        .filter(|value| !value.is_null())
+    {
+        let previous = previous
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("previous_response_id must be a non-empty string")?;
+        let mut history = replay.response_history(previous)?;
+        history.append(&mut items);
+        items = history;
+    }
     let mut names = HashMap::new();
     for item in &items {
-        translate_item(item, replay, &mut contents, &mut system, &mut names)?;
+        translate_item(
+            item,
+            replay,
+            &registry,
+            &mut contents,
+            &mut system,
+            &mut names,
+        )?;
     }
     ensure!(
         !contents.is_empty(),
@@ -191,13 +348,14 @@ pub fn translate(request: &Value, replay: &mut Replay) -> Result<Value> {
     if !declarations.is_empty() {
         result["tools"] = json!([{"functionDeclarations":declarations}]);
     }
-    apply_options(request, &mut result)?;
-    Ok(result)
+    apply_options(request, &mut result, &registry)?;
+    Ok((result, registry))
 }
 
 fn translate_item(
     item: &Value,
     replay: &mut Replay,
+    registry: &HashMap<String, Tool>,
     contents: &mut Vec<Value>,
     system: &mut Vec<Value>,
     names: &mut HashMap<String, Value>,
@@ -233,10 +391,14 @@ fn translate_item(
         }
         "function_call" | "custom_tool_call" | "tool_search_call" => {
             let call_id = required_string(item, "call_id")?;
-            let part = replay.get(call_id)?;
+            let part = replay
+                .get(call_id)
+                .or_else(|_| replay_call(item, call_id, registry))?;
             names.insert(call_id.to_owned(), part["functionCall"].clone());
             push_part(contents, "model", part);
         }
+        // Codex's Antigravity adapter ignores hosted WebSearch history items.
+        "web_search_call" => {}
         "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
             let call_id = required_string(item, "call_id")?;
             let call = names
@@ -265,6 +427,26 @@ fn translate_item(
         kind => bail!("unsupported input item: {kind}"),
     }
     Ok(())
+}
+
+fn replay_call(item: &Value, call_id: &str, registry: &HashMap<String, Tool>) -> Result<Value> {
+    let name = required_string(item, "name")?;
+    let namespace = item["namespace"].as_str();
+    let (wire_name, tool) = registry
+        .iter()
+        .find(|(_, tool)| tool.name == name && tool.namespace.as_deref() == namespace)
+        .context("tool replay is missing and cannot be reconstructed")?;
+    let args = match tool.kind.as_str() {
+        "custom" => json!({"input":required_string(item, "input")?}),
+        "tool_search" => item.get("arguments").cloned().unwrap_or(json!({})),
+        _ => serde_json::from_str(required_string(item, "arguments")?)
+            .context("invalid function call arguments in replay")?,
+    };
+    let mut call = json!({"functionCall":{"name":wire_name,"id":call_id,"args":args}});
+    if let Some(signature) = item.pointer("/extra_content/google/thought_signature") {
+        call["functionCall"]["thoughtSignature"] = signature.clone();
+    }
+    Ok(call)
 }
 
 fn message_parts(content: &Value) -> Result<Vec<Value>> {
@@ -306,15 +488,114 @@ pub fn push_part(contents: &mut Vec<Value>, role: &str, part: Value) {
     contents.push(json!({"role":role,"parts":[part]}));
 }
 
-fn apply_options(request: &Value, result: &mut Value) -> Result<()> {
-    let mode = match request.get("tool_choice") {
-        None | Some(Value::Null) => "AUTO",
-        Some(Value::String(choice)) if choice == "auto" => "AUTO",
-        Some(Value::String(choice)) if choice == "none" => "NONE",
-        Some(Value::String(choice)) if choice == "required" => "ANY",
+fn apply_options(
+    request: &Value,
+    result: &mut Value,
+    registry: &HashMap<String, Tool>,
+) -> Result<()> {
+    let function_config = match request.get("tool_choice") {
+        None | Some(Value::Null) => registry
+            .values()
+            .any(|tool| tool.strict)
+            .then(|| json!({"mode":"VALIDATED"})),
+        Some(Value::String(choice)) if choice == "auto" => registry
+            .values()
+            .any(|tool| tool.strict)
+            .then(|| json!({"mode":"VALIDATED"})),
+        Some(Value::String(choice)) if choice == "none" => Some(json!({"mode":"NONE"})),
+        Some(Value::String(choice)) if choice == "required" => Some(json!({"mode":"ANY"})),
+        Some(Value::Object(choice))
+            if matches!(choice["type"].as_str(), Some("function" | "custom")) =>
+        {
+            let name = choice
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .context("tool_choice function requires a name")?;
+            let flat = resolve_function_tool(name, registry)?;
+            Some(json!({"mode":"ANY","allowedFunctionNames":[flat]}))
+        }
+        Some(Value::Object(choice)) if choice["type"] == "web_search" => {
+            let flat = registry
+                .iter()
+                .find(|(_, tool)| tool.kind == "web_search")
+                .map(|(flat, _)| flat)
+                .context("tool_choice web_search requires a declared web_search tool")?;
+            Some(json!({"mode":"ANY","allowedFunctionNames":[flat]}))
+        }
+        Some(Value::Object(choice)) if choice["type"] == "allowed_tools" => {
+            let mode = match choice.get("mode").and_then(Value::as_str) {
+                Some("auto") => "VALIDATED",
+                Some("required") => "ANY",
+                _ => bail!("tool_choice allowed_tools mode must be auto or required"),
+            };
+            let tools = choice
+                .get("tools")
+                .and_then(Value::as_array)
+                .context("tool_choice allowed_tools requires a tools array")?;
+            ensure!(
+                !tools.is_empty(),
+                "tool_choice allowed_tools cannot be empty"
+            );
+            let mut allowed = Vec::new();
+            for tool in tools {
+                let kind = tool["type"]
+                    .as_str()
+                    .context("tool_choice allowed_tools entries require a type")?;
+                let flat = if matches!(kind, "function" | "custom") {
+                    resolve_function_tool(
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .context("tool_choice allowed function requires a name")?,
+                        registry,
+                    )?
+                } else if matches!(kind, "web_search" | "web_search_preview") {
+                    registry
+                        .iter()
+                        .find(|(_, registered)| registered.kind == "web_search")
+                        .map(|(flat, _)| flat.clone())
+                        .context(
+                            "tool_choice allowed web_search requires a declared web_search tool",
+                        )?
+                } else {
+                    bail!("unsupported tool_choice allowed_tools type: {kind}");
+                };
+                if !allowed.contains(&flat) {
+                    allowed.push(flat);
+                }
+            }
+            Some(json!({"mode":mode,"allowedFunctionNames":allowed}))
+        }
         _ => bail!("unsupported tool_choice"),
     };
-    result["toolConfig"] = json!({"functionCallingConfig":{"mode":mode}});
+    if let Some(function_config) = function_config {
+        if request["tool_choice"]["type"] == "allowed_tools" {
+            let allowed = function_config["allowedFunctionNames"]
+                .as_array()
+                .context("invalid allowed tool names")?;
+            if let Some(declarations) = result["tools"][0]["functionDeclarations"].as_array_mut() {
+                declarations
+                    .retain(|declaration| allowed.iter().any(|name| name == &declaration["name"]));
+            }
+        }
+        result["toolConfig"] = json!({"functionCallingConfig":function_config});
+    }
+    for (source, target, min, max) in [
+        ("temperature", "temperature", 0.0, 2.0),
+        ("top_p", "topP", 0.0, 1.0),
+    ] {
+        if let Some(value) = request.get(source) {
+            let number = value
+                .as_f64()
+                .with_context(|| format!("{source} must be a number"))?;
+            ensure!(
+                (min..=max).contains(&number),
+                "{source} must be between {min} and {max}"
+            );
+            result["generationConfig"][target] = json!(number);
+        }
+    }
     if let Some(effort) = request["reasoning"]["effort"].as_str() {
         result["generationConfig"]["thinkingConfig"]["thinkingLevel"] = json!(match effort {
             "none" | "minimal" | "low" => "LOW",
@@ -347,4 +628,66 @@ fn apply_options(request: &Value, result: &mut Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_function_tool(name: &str, registry: &HashMap<String, Tool>) -> Result<String> {
+    if registry.contains_key(name) {
+        return Ok(name.to_owned());
+    }
+    let matching = registry
+        .iter()
+        .filter(|(_, tool)| tool.name == name || tool.flat == name)
+        .map(|(flat, _)| flat.as_str())
+        .collect::<Vec<_>>();
+    ensure!(
+        matching.len() == 1,
+        "tool_choice function is missing or ambiguous: {name}"
+    );
+    Ok(matching[0].to_owned())
+}
+
+fn google_tool_name(name: &str, registry: &HashMap<String, Tool>) -> String {
+    let bytes = name.as_bytes();
+    if bytes.len() <= 64
+        && bytes
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+        && !registry.contains_key(name)
+    {
+        return name.to_owned();
+    }
+    let cleaned = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let prefix = cleaned
+        .trim_start_matches(|character: char| character == '-' || character.is_ascii_digit());
+    let prefix = if prefix.is_empty() { "tool" } else { prefix };
+    let prefix = &prefix[..prefix.len().min(55)];
+    for salt in 0_u32.. {
+        let input = if salt == 0 {
+            name.to_owned()
+        } else {
+            format!("{name}#{salt}")
+        };
+        let digest = Sha256::digest(input.as_bytes());
+        let suffix = digest[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let candidate = format!("{prefix}_{suffix}");
+        if !registry.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("tool name collision space exhausted")
 }

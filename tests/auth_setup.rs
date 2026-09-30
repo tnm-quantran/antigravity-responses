@@ -8,6 +8,7 @@ use clap::Parser;
 use pretty_assertions::assert_eq;
 use std::{
     collections::HashMap,
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -31,6 +32,7 @@ async fn concurrent_refresh_runs_once_and_persists_rotated_refresh_token() {
             async move {
                 assert_eq!(form["grant_type"],"refresh_token");
                 assert_eq!(form["refresh_token"],"old-refresh");
+                assert!(!form["client_secret"].is_empty());
                 count.fetch_add(1,Ordering::SeqCst);
                 axum::Json(serde_json::json!({"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}))
             }
@@ -51,8 +53,6 @@ async fn concurrent_refresh_runs_once_and_persists_rotated_refresh_token() {
     .unwrap();
     let mut config = Options::parse_from([
         "test",
-        "--client-id",
-        "test-client",
         "--token-url",
         &token_url,
         "--credentials",
@@ -88,10 +88,85 @@ async fn concurrent_refresh_runs_once_and_persists_rotated_refresh_token() {
 }
 
 #[test]
+fn dotenv_configures_model_credentials_and_oauth_for_standalone_cli() {
+    let root = std::env::temp_dir().join(format!("ag-dotenv-{}", uuid::Uuid::new_v4()));
+    let codex_home = root.join("codex");
+    std::fs::create_dir_all(&root).unwrap();
+    let credentials = root.join("credentials.json");
+    save_credentials(
+        &credentials,
+        &Credentials {
+            access_token: "test-access".into(),
+            refresh_token: None,
+            expires_at: u64::MAX,
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".env"),
+        format!(
+            "ANTIGRAVITY_MODEL=dotenv-model\nANTIGRAVITY_CREDENTIALS={}\nCODEX_HOME=/ignored\n",
+            credentials.display()
+        ),
+    )
+    .unwrap();
+
+    let setup = Command::new(env!("CARGO_BIN_EXE_antigravity-responses"))
+        .current_dir(&root)
+        .env_clear()
+        .env("CODEX_HOME", &codex_home)
+        .args(["setup", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+    let config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap();
+    assert!(config.contains("[model_providers.antigravity_responses]"));
+    assert!(config.contains("base_url = \"http://127.0.0.1:8787/v1\""));
+    assert!(config.contains("wire_api = \"responses\""));
+    assert!(config.contains("requires_openai_auth = false"));
+    assert!(!config.contains("[profiles.antigravity_responses]"));
+    assert!(!config.contains("access_token"));
+    let profile =
+        std::fs::read_to_string(codex_home.join("antigravity_responses.config.toml")).unwrap();
+    assert!(profile.contains("model = \"dotenv-model\""));
+    assert!(profile.contains("model_provider = \"antigravity_responses\""));
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_antigravity-responses"))
+        .current_dir(&root)
+        .env_clear()
+        .env("CODEX_HOME", &codex_home)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("OK OAuth credentials"));
+
+    let occupied_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = occupied_port.local_addr().unwrap().port().to_string();
+    let login = Command::new(env!("CARGO_BIN_EXE_antigravity-responses"))
+        .current_dir(&root)
+        .env_clear()
+        .env("CODEX_HOME", codex_home)
+        .args(["login", "--callback-port", &port])
+        .output()
+        .unwrap();
+    let login_error = String::from_utf8_lossy(&login.stderr).to_ascii_lowercase();
+    assert!(
+        login_error.contains("address already in use"),
+        "{login_error}"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn setup_backs_up_existing_config_and_repeated_setup_has_no_extra_backup() {
     let home = std::env::temp_dir().join(format!("ag-config-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&home).unwrap();
-    let original = "# user's settings\nmodel = 'existing'\n";
+    let original = "# user's settings\nmodel = 'existing'\nprofile = 'antigravity_responses'\n[profiles.antigravity_responses]\nmodel = 'legacy'\nmodel_provider = 'antigravity_responses'\n[profiles.user]\nmodel = 'mine'\n";
     std::fs::write(home.join("config.toml"), original).unwrap();
     let config = Options::parse_from(["test", "--model", "gemini-test"]).config;
     setup::setup(&config, "codex", &home).unwrap();
@@ -114,8 +189,13 @@ fn setup_backs_up_existing_config_and_repeated_setup_has_no_extra_backup() {
         .collect();
     assert_eq!(backups.len(), 1);
     assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+    let migrated = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(!migrated.contains("profile = 'antigravity_responses'"));
+    assert!(!migrated.contains("[profiles.antigravity_responses]"));
+    assert!(migrated.contains("[profiles.user]"));
+    assert!(home.join("antigravity_responses.config.toml").exists());
     setup::setup(&config, "codex", &home).unwrap();
-    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 2);
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 4);
     for entry in std::fs::read_dir(&home).unwrap() {
         std::fs::remove_file(entry.unwrap().path()).unwrap();
     }
