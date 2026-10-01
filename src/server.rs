@@ -123,7 +123,7 @@ fn user_agent(configured: &str) -> String {
 pub struct Gateway {
     pub config: Config,
     client: reqwest::Client,
-    replay: Arc<Mutex<Replay>>,
+    replay: Mutex<Replay>,
     credentials: Mutex<auth::TokenCache>,
     projects: Mutex<HashMap<String, Arc<OnceCell<String>>>>,
 }
@@ -220,32 +220,14 @@ impl Gateway {
         config.validate()?;
         Ok(Arc::new(Self {
             client: config.client()?,
-            replay: Arc::new(Mutex::new(Replay::open(
+            replay: Mutex::new(Replay::new(
                 config.state_bytes,
                 Duration::from_secs(config.state_ttl_seconds),
-                config.credentials.with_extension("replay.sqlite3"),
-            )?)),
+            )),
             projects: Mutex::new(HashMap::new()),
             credentials: Mutex::new(auth::TokenCache::default()),
             config,
         }))
-    }
-
-    async fn store_response(
-        &self,
-        id: String,
-        parent: Option<String>,
-        items: Vec<Value>,
-    ) -> Result<()> {
-        let replay = self.replay.clone();
-        tokio::task::spawn_blocking(move || {
-            // ponytail: writes share one lock; per-session journals if concurrent sessions contend.
-            replay
-                .blocking_lock()
-                .store_response(&id, parent.as_deref(), items)
-        })
-        .await
-        .context("join replay persistence task")?
     }
 
     async fn project(&self, token: &str) -> Result<String> {
@@ -465,7 +447,6 @@ async fn responses(
         Some(Value::Bool(stream)) => *stream,
         _ => return error(StatusCode::BAD_REQUEST, "stream must be boolean"),
     };
-    let parent_id = request["previous_response_id"].as_str().map(str::to_owned);
     let web_search_options = request["tools"]
         .as_array()
         .and_then(|tools| {
@@ -480,11 +461,6 @@ async fn responses(
     let allowed_domains = match web_search_domains(web_search_options.as_ref()) {
         Ok(domains) => domains,
         Err(error_value) => return error(StatusCode::BAD_REQUEST, &error_value.to_string()),
-    };
-    let turn_input = match &request["input"] {
-        Value::String(text) => vec![json!({"role":"user","content":text})],
-        Value::Array(items) => items.clone(),
-        _ => Vec::new(),
     };
     let translated = translate_with_tools(
         &request,
@@ -536,8 +512,6 @@ async fn responses(
         gateway,
         upstream,
         translator,
-        parent_id,
-        turn_input,
         body,
         model,
         web_search_options,
@@ -640,8 +614,6 @@ fn translate_stream(
     gateway: Arc<Gateway>,
     upstream: reqwest::Response,
     mut translator: Translator,
-    parent_id: Option<String>,
-    mut turn_input: Vec<Value>,
     request_body: Value,
     model: String,
     web_search_options: Option<Value>,
@@ -650,7 +622,7 @@ fn translate_stream(
 ) -> impl futures::Stream<Item = std::result::Result<Value, Infallible>> + Send {
     async_stream::stream! {
         if search_sidecar {
-            let sidecar = search_sidecar_stream(gateway, upstream, translator, parent_id, turn_input, request_body, model, web_search_options, allowed_domains).await;
+            let sidecar = search_sidecar_stream(gateway, upstream, translator, request_body, model, web_search_options, allowed_domains).await;
             futures::pin_mut!(sidecar);
             while let Some(event) = sidecar.next().await { yield event; }
             return;
@@ -682,19 +654,7 @@ fn translate_stream(
         if failed { yield Ok(translator.failed()); }
         else {
             match translator.completed() {
-                Ok(event) => {
-                    if matches!(event["type"].as_str(), Some("response.completed" | "response.incomplete")) {
-                        turn_input.extend(event["response"]["output"].as_array().cloned().unwrap_or_default());
-                        if let Some(id) = event["response"]["id"].as_str() {
-                            if let Err(error_value) = gateway.store_response(id.to_owned(), parent_id.clone(), turn_input).await {
-                                eprintln!("stream request_id={}: {error_value:#}", id);
-                                yield Ok(translator.failed());
-                                return;
-                            }
-                        }
-                    }
-                    yield Ok(event)
-                },
+                Ok(event) => { yield Ok(event) },
                 Err(error_value) => { eprintln!("stream request_id={}: {error_value:#}",translator.response["id"]); yield Ok(translator.failed()); }
             }
         }
@@ -705,8 +665,6 @@ async fn search_sidecar_stream(
     gateway: Arc<Gateway>,
     mut upstream_response: reqwest::Response,
     mut translator: Translator,
-    parent_id: Option<String>,
-    mut turn_input: Vec<Value>,
     mut request_body: Value,
     model: String,
     web_search_options: Option<Value>,
@@ -754,8 +712,6 @@ async fn search_sidecar_stream(
                 let translated = async {
                     let mut replay = gateway.replay.lock().await;
                     let events = translator.ingest(&final_response, &mut replay)?;
-                    let output = &translator.response["output"].as_array().context("invalid output")?[output_start..];
-                    turn_input.push(store_model_history(parts, output, &[], &mut replay)?);
                     Ok::<_, anyhow::Error>(events)
                 }.await;
                 match translated {
@@ -865,8 +821,7 @@ async fn search_sidecar_stream(
                     let mut replay = gateway.replay.lock().await;
                     let events = translator.ingest(&visible_response, &mut replay)?;
                     let output = &translator.response["output"].as_array().context("invalid output")?[output_start..];
-                    turn_input.push(store_model_history(model_parts, output, &search_outputs, &mut replay)?);
-                    turn_input.extend(search_outputs);
+                    store_model_history(model_parts, output, &search_outputs, &mut replay)?;
                     Ok::<_, anyhow::Error>(events)
                 }.await;
                 match translated {
@@ -878,18 +833,6 @@ async fn search_sidecar_stream(
                     }
                 }
                 break;
-            }
-            let stored = {
-                let mut replay = gateway.replay.lock().await;
-                store_model_history(model_parts.clone(), &[], &[], &mut replay)
-            };
-            match stored {
-                Ok(item) => { turn_input.push(item); turn_input.extend(search_outputs); },
-                Err(error_value) => {
-                    eprintln!("stream request_id={}: {error_value:#}", translator.response["id"]);
-                    yield Ok(translator.failed());
-                    return;
-                }
             }
             request_body["contents"].as_array_mut().unwrap().push(json!({"role":"model","parts":model_parts}));
             request_body["contents"].as_array_mut().unwrap().push(json!({"role":"user","parts":function_responses}));
@@ -927,16 +870,7 @@ async fn search_sidecar_stream(
         }
         translator.set_aggregate_usage(&total_usage);
         match translator.completed() {
-            Ok(event) => {
-                if matches!(event["type"].as_str(), Some("response.completed" | "response.incomplete"))
-                    && let Some(id) = event["response"]["id"].as_str()
-                    && let Err(error_value) = gateway.store_response(id.to_owned(), parent_id.clone(), turn_input).await {
-                            eprintln!("stream request_id={id}: {error_value:#}");
-                            yield Ok(translator.failed());
-                            return;
-                }
-                yield Ok(event)
-            },
+            Ok(event) => { yield Ok(event) },
             Err(error_value) => {
                 eprintln!("stream request_id={}: {error_value:#}", translator.response["id"]);
                 yield Ok(translator.failed());
@@ -950,7 +884,7 @@ fn store_model_history(
     output: &[Value],
     search_outputs: &[Value],
     replay: &mut Replay,
-) -> Result<Value> {
+) -> Result<()> {
     let mut calls = output.iter().filter(|item| {
         matches!(
             item["type"].as_str(),
@@ -979,7 +913,7 @@ fn store_model_history(
             }
         }
     }
-    Ok(json!({"type":"reasoning","id":id,"summary":[]}))
+    Ok(())
 }
 
 async fn collect_response(response: reqwest::Response, limit: usize) -> Result<Value> {

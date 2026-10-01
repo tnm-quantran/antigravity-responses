@@ -27,10 +27,6 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        Self::new_with_state_bytes(67108864).await
-    }
-
-    async fn new_with_state_bytes(state_bytes: usize) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (chunks, receiver) = mpsc::channel::<String>(8);
         let receiver = Arc::new(Mutex::new(receiver));
@@ -84,7 +80,6 @@ impl Fixture {
         ])
         .config;
         config.access_token = None;
-        config.state_bytes = state_bytes;
         let gateway = Gateway::new(config).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -324,54 +319,6 @@ async fn web_search_remains_available_until_three_searches() {
 }
 
 #[tokio::test]
-async fn previous_response_id_continues_beyond_replay_cache_budget() {
-    let fixture = Fixture::new_with_state_bytes(30).await;
-    let client = reqwest::Client::new();
-    fixture
-        .send(json!({"candidates":[{"content":{"parts":[{"text":"first answer"}]},"finishReason":"STOP"}]}))
-        .await;
-    fixture.eof().await;
-    let first: Value = client
-        .post(format!("{}/v1/responses", fixture.url))
-        .json(&json!({"model":"test","input":"first prompt"}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    fixture
-        .send(json!({"candidates":[{"content":{"parts":[{"text":"second answer"}]},"finishReason":"STOP"}]}))
-        .await;
-    fixture.eof().await;
-    let _: Value = client
-        .post(format!("{}/v1/responses", fixture.url))
-        .json(&json!({"model":"test","previous_response_id":first["id"],"input":"second prompt"}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    let captured = fixture.requests.lock().await;
-    assert_eq!(captured.len(), 2);
-    assert_eq!(
-        captured[1]["request"]["contents"],
-        json!([
-            {"role":"user","parts":[{"text":"first prompt"}]},
-            {"role":"model","parts":[{"text":"first answer"}]},
-            {"role":"user","parts":[{"text":"second prompt"}]}
-        ])
-    );
-}
-
-#[tokio::test]
 async fn sse_delta_arrives_before_backend_completion() {
     let fixture = Fixture::new().await;
     let response = reqwest::Client::new()
@@ -508,18 +455,14 @@ async fn mixed_search_and_mcp_calls_are_returned_once_in_either_order() {
             1
         );
         assert_eq!(fixture.requests.lock().await.len(), 2);
-        for uses_previous_response in [true, false] {
+        {
             fixture.send(json!({"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}]})).await;
             fixture.eof().await;
             let mut next = json!({"model":"test","tools":[{"type":"web_search"},{"type":"function","name":"mcp__apps__inspect"}],"input":[{"type":"function_call_output","call_id":call["call_id"],"output":"ok"}]});
-            if uses_previous_response {
-                next["previous_response_id"] = response["id"].clone();
-            } else {
-                let mut history = vec![json!({"role":"user","content":"inspect"})];
-                history.extend(output.clone());
-                history.push(next["input"][0].clone());
-                next["input"] = json!(history);
-            }
+            let mut history = vec![json!({"role":"user","content":"inspect"})];
+            history.extend(output.clone());
+            history.push(next["input"][0].clone());
+            next["input"] = json!(history);
             reqwest::Client::new()
                 .post(format!("{}/v1/responses", fixture.url))
                 .json(&next)

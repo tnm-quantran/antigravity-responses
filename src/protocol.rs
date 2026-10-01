@@ -180,23 +180,17 @@ pub(crate) fn translate_with_tools(
         system
             .push(json!({"text":instructions.as_str().context("instructions must be a string")?}));
     }
-    let mut items = match request.get("input") {
+    let items = match request.get("input") {
         Some(Value::String(text)) => vec![json!({"role":"user","content":text})],
         Some(Value::Array(items)) => items.clone(),
         _ => bail!("input must be a string or array"),
     };
-    if let Some(previous) = request
-        .get("previous_response_id")
-        .filter(|value| !value.is_null())
-    {
-        let previous = previous
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .context("previous_response_id must be a non-empty string")?;
-        let mut history = replay.response_history(previous)?;
-        history.append(&mut items);
-        items = history;
-    }
+    ensure!(
+        request
+            .get("previous_response_id")
+            .is_none_or(Value::is_null),
+        "previous_response_id unsupported; send the full conversation in input"
+    );
     let mut names = HashMap::new();
     for item in &items {
         translate_item(
