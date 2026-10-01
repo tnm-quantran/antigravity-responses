@@ -223,7 +223,7 @@ impl Gateway {
             replay: Arc::new(Mutex::new(Replay::open(
                 config.state_bytes,
                 Duration::from_secs(config.state_ttl_seconds),
-                config.credentials.with_extension("replay.json"),
+                config.credentials.with_extension("replay.sqlite3"),
             )?)),
             projects: Mutex::new(HashMap::new()),
             credentials: Mutex::new(auth::TokenCache::default()),

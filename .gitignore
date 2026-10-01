@@ -2,3 +2,6 @@
 .env
 *.credentials.json
 antigravity.credentials.replay.json
+
+*.replay.sqlite3
+*.replay.sqlite3-journal

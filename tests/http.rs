@@ -27,6 +27,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_state_bytes(67108864).await
+    }
+
+    async fn new_with_state_bytes(state_bytes: usize) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (chunks, receiver) = mpsc::channel::<String>(8);
         let receiver = Arc::new(Mutex::new(receiver));
@@ -80,6 +84,7 @@ impl Fixture {
         ])
         .config;
         config.access_token = None;
+        config.state_bytes = state_bytes;
         let gateway = Gateway::new(config).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -319,8 +324,8 @@ async fn web_search_remains_available_until_three_searches() {
 }
 
 #[tokio::test]
-async fn previous_response_id_continues_the_conversation() {
-    let fixture = Fixture::new().await;
+async fn previous_response_id_continues_beyond_replay_cache_budget() {
+    let fixture = Fixture::new_with_state_bytes(30).await;
     let client = reqwest::Client::new();
     fixture
         .send(json!({"candidates":[{"content":{"parts":[{"text":"first answer"}]},"finishReason":"STOP"}]}))

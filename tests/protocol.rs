@@ -460,20 +460,13 @@ fn safety_errors_and_unknown_tools_fail_explicitly() {
 }
 
 #[test]
-fn replay_is_bounded_and_missing_state_is_not_fabricated() {
+fn replay_cache_budget_does_not_discard_state() {
     let mut state = Replay::new(30, Duration::from_secs(60));
-    state.insert("one".into(), json!("0123456789")).unwrap();
-    state.insert("two".into(), json!("0123456789")).unwrap();
-    state.insert("three".into(), json!("0123456789")).unwrap();
-    assert!(state.get("one").is_err());
-    assert_eq!(state.get("three").unwrap(), json!("0123456789"));
-    assert!(
-        translate(
-            &json!({"input":[{"type":"function_call","call_id":"unknown"}]}),
-            &mut state
-        )
-        .is_err()
-    );
+    for key in ["one", "two", "three"] {
+        state.insert(key.into(), json!("0123456789")).unwrap();
+    }
+    assert_eq!(state.get("one").unwrap(), json!("0123456789"));
+    assert!(state.get("missing").is_err());
 }
 
 #[test]
@@ -673,12 +666,172 @@ fn tool_search_discovery_registers_and_calls_new_mcp_tool() {
 }
 
 #[test]
-fn replay_appends_only_new_batches_and_reopens_signatures() {
-    let path = std::env::temp_dir().join(format!("ag-replay-{}.json", uuid::Uuid::new_v4()));
-    let mut state = Replay::open(1024 * 1024, Duration::from_secs(60), path.clone()).unwrap();
-    state.insert("call".into(), json!({"functionCall":{"name":"lookup","args":{}},"thoughtSignature":"signed","padding":"x".repeat(10_000)})).unwrap();
-    state.store_response("one", None, vec![]).unwrap();
-    let first = std::fs::read(&path).unwrap();
+fn sqlite_reopens_signatures_and_deduplicates_response_items() {
+    let directory = std::env::temp_dir().join(format!("ag-replay-{}", uuid::Uuid::new_v4()));
+    let path = directory.join("replay.sqlite3");
+    let mut state = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
+    let part = json!({"text":"answer","thoughtSignature":"signed","padding":"x".repeat(10_000)});
+    state
+        .insert("ag_message".into(), json!([part.clone()]))
+        .unwrap();
+    let item = json!({"id":"ag_message","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]});
+    for index in 0..30 {
+        state
+            .store_response(&index.to_string(), None, vec![item.clone()])
+            .unwrap();
+    }
+    let database = rusqlite::Connection::open(&path).unwrap();
+    let count: i64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM replay WHERE key LIKE 'item:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(std::fs::metadata(&path).unwrap().len() > 1024);
+    drop(state);
+    let mut reopened = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
+    assert_eq!(reopened.get("ag_message").unwrap(), json!([part]));
+    assert_eq!(reopened.response_history("0").unwrap(), vec![item]);
+    let body = translate(
+        &json!({"model":"test","previous_response_id":"29","input":"next"}),
+        &mut reopened,
+    )
+    .unwrap();
+    assert_eq!(
+        body["contents"][0]["parts"][0]["thoughtSignature"],
+        "signed"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    drop(reopened);
+    drop(database);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sqlite_imports_legacy_formats_once_and_ignores_incomplete_journal_tail() {
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 60;
+    for journal in [false, true] {
+        let directory = std::env::temp_dir().join(format!("ag-replay-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("replay.sqlite3");
+        let legacy = path.with_extension("json");
+        let item = json!({"id":"ag_legacy","type":"reasoning","summary":[]});
+        let mut entries = vec![
+            json!(["ag_legacy",[{"thoughtSignature":"signed"}],expires]),
+            json!(["expired", {}, 0]),
+            json!(["response:one",{"parent":null,"items":[item.clone()]},expires]),
+        ];
+        for index in 0..4100 {
+            entries.push(json!([format!("call_{index}"),{"padding":"x".repeat(100)},expires]));
+        }
+        let batch = serde_json::to_string(&entries).unwrap();
+        let bytes = if journal {
+            format!("antigravity-replay-v1\n{batch}\n[[\"interrupted")
+        } else {
+            batch
+        };
+        std::fs::write(&legacy, &bytes).unwrap();
+        let mut state = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
+        assert_eq!(
+            state.get("ag_legacy").unwrap()[0]["thoughtSignature"],
+            "signed"
+        );
+        assert!(state.get("expired").is_err());
+        assert!(state.get("interrupted").is_err());
+        assert!(state.get("call_0").is_ok());
+        assert!(state.get("call_4099").is_ok());
+        assert_eq!(state.response_history("one").unwrap(), vec![item]);
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), bytes);
+        state
+            .insert("ag_legacy".into(), json!([{"thoughtSignature":"updated"}]))
+            .unwrap();
+        drop(state);
+        let mut reopened = Replay::open(1024, Duration::from_secs(60), path).unwrap();
+        assert_eq!(
+            reopened.get("ag_legacy").unwrap()[0]["thoughtSignature"],
+            "updated"
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn sqlite_legacy_import_rolls_back_and_can_be_retried() {
+    let directory = std::env::temp_dir().join(format!("ag-replay-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("replay.sqlite3");
+    let legacy = path.with_extension("json");
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 60;
+    let valid = format!(
+        "antigravity-replay-v1\n{}\n",
+        json!([["call_live",{"thoughtSignature":"signed"},expires]])
+    );
+    std::fs::write(&legacy, format!("{valid}broken batch\n")).unwrap();
+    assert!(Replay::open(1024, Duration::from_secs(60), path.clone()).is_err());
+    let database = rusqlite::Connection::open(&path).unwrap();
+    let count: i64 = database
+        .query_row("SELECT COUNT(*) FROM replay", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    std::fs::write(&legacy, valid).unwrap();
+    let mut recovered = Replay::open(1024, Duration::from_secs(60), path).unwrap();
+    assert_eq!(
+        recovered.get("call_live").unwrap()["thoughtSignature"],
+        "signed"
+    );
+    drop(recovered);
+    drop(database);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sqlite_retains_referenced_history_and_prunes_only_unused_expired_state() {
+    let directory = std::env::temp_dir().join(format!("ag-replay-{}", uuid::Uuid::new_v4()));
+    let path = directory.join("replay.sqlite3");
+    let mut state = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
+    state
+        .insert("ag_group".into(), json!([{ "thoughtSignature":"signed" }]))
+        .unwrap();
+    state
+        .insert(
+            "call_search".into(),
+            json!({"functionCall":{"name":"search","args":{}}}),
+        )
+        .unwrap();
+    state
+        .insert(
+            "group_outputs:ag_group".into(),
+            json!([{"call_id":"call_search","output":"found"}]),
+        )
+        .unwrap();
+    state
+        .insert("tool_group:ag_reasoning".into(), json!("ag_group"))
+        .unwrap();
+    state
+        .store_response(
+            "one",
+            None,
+            vec![json!({"type":"reasoning","id":"ag_reasoning"})],
+        )
+        .unwrap();
     state
         .store_response(
             "two",
@@ -686,99 +839,73 @@ fn replay_appends_only_new_batches_and_reopens_signatures() {
             vec![json!({"role":"user","content":"next"})],
         )
         .unwrap();
-    let second = std::fs::read(&path).unwrap();
-    assert!(second.starts_with(&first));
-    assert!(second.len() - first.len() < 512);
-    let mut reopened = Replay::open(1024 * 1024, Duration::from_secs(60), path.clone()).unwrap();
-    assert_eq!(reopened.get("call").unwrap()["thoughtSignature"], "signed");
-    assert_eq!(
-        reopened.response_history("two").unwrap(),
-        vec![json!({"role":"user","content":"next"})]
-    );
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn replay_migrates_legacy_store_and_recovers_incomplete_batch() {
-    use std::io::Write;
-    let path = std::env::temp_dir().join(format!("ag-replay-{}.json", uuid::Uuid::new_v4()));
-    let expires = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 60;
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&json!([["legacy",{"thoughtSignature":"signed"},expires]])).unwrap(),
-    )
-    .unwrap();
-    let mut state = Replay::open(4096, Duration::from_secs(60), path.clone()).unwrap();
-    state.store_response("one", None, vec![]).unwrap();
-    assert_eq!(state.get("legacy").unwrap()["thoughtSignature"], "signed");
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .unwrap();
-    file.write_all(b"[[\"interrupted").unwrap();
-    drop(file);
-    let mut recovered = Replay::open(4096, Duration::from_secs(60), path.clone()).unwrap();
-    assert!(recovered.get("interrupted").is_err());
-    assert_eq!(
-        recovered.get("legacy").unwrap()["thoughtSignature"],
-        "signed"
-    );
-    recovered
-        .store_response("two", Some("one"), vec![])
-        .unwrap();
-    let mut reopened = Replay::open(4096, Duration::from_secs(60), path.clone()).unwrap();
-    assert!(reopened.response_history("two").unwrap().is_empty());
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn replay_compaction_stays_within_disk_limit() {
-    let path = std::env::temp_dir().join(format!("ag-replay-{}.json", uuid::Uuid::new_v4()));
-    let mut state = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
-    for index in 0..30 {
-        state
-            .store_response(
-                &index.to_string(),
-                None,
-                vec![json!({"content":"x".repeat(100)})],
-            )
-            .unwrap();
-        assert!(std::fs::metadata(&path).unwrap().len() <= 1024);
-    }
-    let mut reopened = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
-    assert_eq!(
-        reopened.response_history("29").unwrap(),
-        vec![json!({"content":"x".repeat(100)})]
-    );
-    assert!(reopened.response_history("0").is_err());
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn replay_compaction_preserves_latest_response_call() {
-    let path = std::env::temp_dir().join(format!("ag-replay-{}.json", uuid::Uuid::new_v4()));
-    let mut state = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
-    state
-        .insert(
-            "call-live".into(),
-            json!({"functionCall":{"name":"lookup","args":{}},"thoughtSignature":"s".repeat(180)}),
+    state.insert("unused".into(), json!({})).unwrap();
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database
+        .execute(
+            "UPDATE replay SET expires = 0 WHERE key != 'response:two'",
+            [],
         )
         .unwrap();
-    state.store_response("latest", None, vec![json!({"type":"function_call","call_id":"call-live","name":"lookup","arguments":"{}"}),json!({"role":"user","content":"x".repeat(420)})]).unwrap();
+    state.get("response:two").unwrap();
+    state.store_response("three", Some("two"), vec![]).unwrap();
+    assert!(state.get("unused").is_err());
+    assert_eq!(
+        state.get("ag_group").unwrap()[0]["thoughtSignature"],
+        "signed"
+    );
+    assert!(state.get("call_search").is_ok());
+    assert_eq!(state.response_history("three").unwrap().len(), 2);
+    let retained: i64 = database
+        .query_row("SELECT COUNT(*) FROM replay WHERE expires = 0", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(retained, 0);
+    database
+        .execute(
+            "UPDATE replay SET expires = 0 WHERE key = 'response:three'",
+            [],
+        )
+        .unwrap();
+    assert!(state.response_history("three").is_err());
+    drop(state);
+    drop(database);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn sqlite_response_failure_rolls_back_history_and_preserves_provider_parts() {
+    let directory = std::env::temp_dir().join(format!("ag-replay-{}", uuid::Uuid::new_v4()));
+    let path = directory.join("replay.sqlite3");
+    let mut state = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
+    state
+        .insert("call-live".into(), json!({"thoughtSignature":"signed"}))
+        .unwrap();
+    let database = rusqlite::Connection::open(&path).unwrap();
+    database.execute_batch("CREATE TRIGGER fail_response BEFORE INSERT ON replay WHEN NEW.key LIKE 'response:%' BEGIN SELECT RAISE(ABORT, 'test write failure'); END;").unwrap();
+    assert!(
+        state
+            .store_response("latest", None, vec![json!({"content":"x".repeat(500)})])
+            .is_err()
+    );
     assert_eq!(
         state.get("call-live").unwrap()["thoughtSignature"],
-        "s".repeat(180)
+        "signed"
     );
-    let mut reopened = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
+    let count: i64 = database
+        .query_row("SELECT COUNT(*) FROM replay", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    drop(state);
+    let mut reopened = Replay::open(1024, Duration::from_secs(60), path).unwrap();
     assert_eq!(
         reopened.get("call-live").unwrap()["thoughtSignature"],
-        "s".repeat(180)
+        "signed"
     );
-    std::fs::remove_file(path).unwrap();
+    drop(reopened);
+    drop(database);
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -812,31 +939,6 @@ fn image_base64_validation_handles_chunk_boundaries_and_padding() {
     request["input"][0]["content"][0]["image_url"] =
         json!(format!("data:image/png;base64,{invalid}"));
     assert!(translate(&request, &mut replay()).is_err());
-}
-
-#[test]
-fn failed_compaction_preserves_cached_parts() {
-    let directory = std::env::temp_dir().join(format!("ag-replay-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&directory).unwrap();
-    let path = directory.join("replay.json");
-    let mut state = Replay::open(1024, Duration::from_secs(60), path.clone()).unwrap();
-    state
-        .insert(
-            "call-live".into(),
-            json!({"thoughtSignature":"s".repeat(180)}),
-        )
-        .unwrap();
-    std::fs::create_dir(&path).unwrap();
-    assert!(
-        state
-            .store_response("latest", None, vec![json!({"content":"x".repeat(500)})])
-            .is_err()
-    );
-    assert_eq!(
-        state.get("call-live").unwrap()["thoughtSignature"],
-        "s".repeat(180)
-    );
-    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

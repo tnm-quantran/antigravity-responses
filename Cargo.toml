@@ -1,6 +1,6 @@
 [package]
 name = "antigravity-responses"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -16,6 +16,7 @@ dotenvy = "0.15"
 eventsource-stream = "0.2"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

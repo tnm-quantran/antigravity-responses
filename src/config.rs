@@ -55,8 +55,10 @@ pub struct Config {
     pub token_url: String,
     #[arg(long, env = "ANTIGRAVITY_TIMEOUT_SECONDS", default_value_t = 120)]
     pub timeout_seconds: u64,
+    /// Replay state expires after this many seconds without use.
     #[arg(long, env = "ANTIGRAVITY_STATE_TTL_SECONDS", default_value_t = 86400)]
     pub state_ttl_seconds: u64,
+    /// SQLite page cache budget in bytes; does not limit replay data on disk.
     #[arg(long, env = "ANTIGRAVITY_STATE_BYTES", default_value_t = 67108864)]
     pub state_bytes: usize,
     #[arg(long, env = "ANTIGRAVITY_SCHEMA_POLICY", default_value = "compatible", value_parser = ["compatible", "reject-lossy"])]
